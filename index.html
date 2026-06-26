@@ -2,32 +2,21 @@
 <html lang="zh">
 <head>
 <meta charset="UTF-8">
-<title>量化回测系统 V5</title>
+<title>简易量化回测 V1</title>
 <style>
-body{font-family:Arial;background:#0b1220;color:#fff;padding:20px}
-button,input,select{padding:10px;margin:5px;width:100%}
-.card{background:#162033;padding:15px;border-radius:10px;margin-top:10px}
+body{background:#0b1220;color:white;font-family:Arial;padding:20px}
+button{padding:10px;width:100%;margin-top:10px}
+.card{background:#162033;padding:15px;border-radius:10px}
 pre{white-space:pre-wrap}
 </style>
 </head>
 
 <body>
 
-<h2>🚀 币安量化回测 V5（实盘结构版）</h2>
+<h2>🚀 简易回测系统 V1</h2>
 
 <div class="card">
-
-<select id="symbol">
-<option>BTCUSDT</option>
-<option>ETHUSDT</option>
-<option>SOLUSDT</option>
-</select>
-
-<input id="capital" value="300">
-<input id="limit" value="2000">
-
 <button onclick="run()">开始回测</button>
-
 </div>
 
 <div class="card">
@@ -36,98 +25,77 @@ pre{white-space:pre-wrap}
 
 <script>
 
-async function fetchData(symbol, limit){
-    const res = await fetch(`https://fapi.binance.com/fapi/v1/klines?symbol=${symbol}&interval=1m&limit=${limit}`);
-    const data = await res.json();
+// ===== 模拟K线（避免接口问题）=====
+function generateData(){
+    let data=[];
+    let price=100;
+    for(let i=0;i<500;i++){
+        let change=(Math.random()-0.5)*2;
+        price+=change;
 
-    return data.map(k => ({
-        open:+k[1],
-        high:+k[2],
-        low:+k[3],
-        close:+k[4],
-        vol:+k[5]
-    }));
+        data.push({
+            open:price,
+            close:price+(Math.random()-0.5),
+            high:price+Math.random(),
+            low:price-Math.random(),
+            vol:Math.random()*100
+        });
+    }
+    return data;
 }
 
-function avg(arr){
-    return arr.reduce((a,b)=>a+b,0)/arr.length;
-}
-
-// ===== 策略信号 =====
+// ===== 简单策略 =====
 function signal(data,i){
+    if(i<20) return null;
 
-    let slice = data.slice(i-20,i);
+    let slice=data.slice(i-20,i);
+    let high20=Math.max(...slice.map(x=>x.high));
 
-    let high20 = Math.max(...slice.map(x=>x.high));
-    let volAvg = avg(slice.map(x=>x.vol));
-
-    let c = data[i];
-
-    // 防插针
-    let body = Math.abs(c.open-c.close);
-    let wick = c.high - Math.max(c.open,c.close);
-    if(wick > body*3) return null;
-
-    // 趋势突破
-    if(c.close > high20 && c.vol > volAvg*1.5){
+    if(data[i].close>high20){
         return "LONG";
     }
-
     return null;
 }
 
-async function run(){
+// ===== 回测 =====
+function run(){
 
-let data = await fetchData(
-    document.getElementById("symbol").value,
-    document.getElementById("limit").value
-);
+let data=generateData();
 
-let capital = Number(document.getElementById("capital").value);
-let position = null;
-let fee = 0.0004;
-let slippage = 0.0005;
+let capital=300;
+let position=null;
+let trades=[];
 
-let trades = [];
-let equity = [];
+for(let i=20;i<data.length;i++){
 
-for(let i=50;i<data.length-1;i++){
+    let sig=signal(data,i);
 
-    let sig = signal(data,i);
-    let next = data[i+1];
+    let price=data[i].close;
 
-    // 持仓处理
     if(position){
 
-        let pnl = (next.close - position.entry)/position.entry;
+        let pnl=(price-position.entry)/position.entry;
 
-        if(pnl < -0.012 || pnl > 0.03){
-            capital += capital * pnl;
-            capital -= capital * fee;
-            position = null;
+        if(pnl>0.03 || pnl<-0.015){
+            capital+=capital*pnl;
+            position=null;
             trades.push(pnl);
         }
     }
 
-    // 开仓（t+1执行）
-    if(sig === "LONG" && !position){
-        position = {
-            entry: next.close * (1+slippage)
-        };
+    if(sig==="LONG" && !position){
+        position={entry:price};
     }
-
-    equity.push(capital);
 }
 
-let win = trades.filter(x=>x>0).length;
-let lose = trades.filter(x=>x<=0).length;
+let win=trades.filter(x=>x>0).length;
+let lose=trades.filter(x=>x<=0).length;
 
-document.getElementById("out").innerText = `
+document.getElementById("out").innerText=`
 最终资金：${capital.toFixed(2)}
 收益率：${((capital-300)/300*100).toFixed(2)}%
 交易次数：${trades.length}
 胜率：${(win/(win+lose||1)*100).toFixed(2)}%
-最大回撤：计算可后加
 `;
 }
 
