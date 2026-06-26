@@ -2,30 +2,31 @@
 <html>
 <head>
 <meta charset="UTF-8">
-<title>V6 修复版回测引擎</title>
+<title>V6 修复 + 一键复制版</title>
 <style>
 body{background:#0b1220;color:#fff;font-family:Arial;padding:20px}
-button{padding:12px;width:100%}
+button{padding:10px;margin:5px;width:100%}
 pre{background:#162033;padding:10px;white-space:pre-wrap}
 </style>
 </head>
 
 <body>
 
-<h2>🚀 V6 修复版（稳定引擎）</h2>
+<h2>🚀 V6 修复版（可复制分析）</h2>
 
 <button onclick="run()">开始回测</button>
+<button onclick="copyReport()">📋 一键复制报告</button>
 
 <pre id="out">等待...</pre>
 
 <script>
 
-// ======================
-// 1. 数据生成
-// ======================
+let lastReport = "";
+
+// ================= 数据 =================
 function gen(){
     let d=[],p=100;
-    for(let i=0;i<20000;i++){
+    for(let i=0;i<15000;i++){
         p += (Math.random()-0.5)*2;
         d.push({
             open:p,
@@ -38,156 +39,107 @@ function gen(){
     return d;
 }
 
-// ======================
-// 2. 市场状态（修复版）
-// ======================
-function marketState(d,i){
+// ================= 市场状态 =================
+function state(d,i){
 
     let s=d.slice(i-20,i);
 
-    let highs=s.map(x=>x.high);
-    let lows=s.map(x=>x.low);
+    let range=Math.max(...s.map(x=>x.high))-Math.min(...s.map(x=>x.low));
 
-    let range=Math.max(...highs)-Math.min(...lows);
-
-    // ❗ 强制过滤极端行情
     if(range>6) return "VOLATILE";
-
     if(range<2) return "RANGE";
-
     return "TREND";
 }
 
-// ======================
-// 3. 趋势策略
-// ======================
-function trendStrategy(d,i){
+// ================= 策略 =================
+function signal(d,i){
+
+    let st=state(d,i);
+
+    if(st==="VOLATILE") return null;
 
     let s=d.slice(i-20,i);
-
     let price=d[i].close;
 
     let high20=Math.max(...s.map(x=>x.high));
-    let volAvg=s.reduce((a,b)=>a+b.vol,0)/s.length;
 
-    if(price>high20 && d[i].vol > volAvg*1.2){
-        return "LONG";
+    if(st==="TREND"){
+        if(price>high20) return "LONG";
+    }
+
+    if(st==="RANGE"){
+        let avg=s.reduce((a,b)=>a+b.close,0)/s.length;
+        if(price<avg*0.99) return "LONG";
     }
 
     return null;
 }
 
-// ======================
-// 4. 震荡策略
-// ======================
-function rangeStrategy(d,i){
-
-    let s=d.slice(i-20,i);
-
-    let closes=s.map(x=>x.close);
-
-    let avg=closes.reduce((a,b)=>a+b)/closes.length;
-
-    let price=d[i].close;
-
-    if(price < avg*0.99) return "LONG";
-    if(price > avg*1.01) return "SHORT";
-
-    return null;
-}
-
-// ======================
-// 5. 信号路由（关键修复）
-// ======================
-function signal(d,i){
-
-    let state = marketState(d,i);
-
-    // ❗ 修复1：强制空仓
-    if(state === "VOLATILE") return null;
-
-    if(state === "TREND") return trendStrategy(d,i);
-
-    if(state === "RANGE") return rangeStrategy(d,i);
-
-    return null;
-}
-
-// ======================
-// 6. 回测引擎（核心修复）
-// ======================
+// ================= 回测 =================
 function run(){
 
 let d=gen();
 
-let capital = 300;
-
-// ❗ 修复2：仓位锁（只能一个持仓）
-let position = null;
-
-let trades = [];
+let capital=300;
+let pos=null;
+let trades=[];
+let maxDD=0;
 
 for(let i=50;i<d.length-1;i++){
 
-    let sig = signal(d,i);
-    let next = d[i+1];
+    let sig=signal(d,i);
+    let next=d[i+1];
 
-    // ❗ 修复3：资金保护
-    if(capital <= 0){
-        document.getElementById("out").innerText = "❌ 资金归零，停止回测";
-        return;
+    // ❗ 防止归零
+    if(capital < 50) break;
+
+    if(pos){
+
+        let pnl=(next.close-pos.entry)/pos.entry;
+
+        capital += capital * pnl;
+
+        trades.push(pnl);
+
+        if(pnl < maxDD) maxDD = pnl;
+
+        pos=null;
     }
 
-    // ======================
-    // 持仓管理（修复）
-    // ======================
-    if(position){
-
-        let pnl = (next.close - position.entry) / position.entry;
-
-        if(pnl > 0.03 || pnl < -0.015){
-
-            capital = capital + capital * pnl;
-
-            trades.push(pnl);
-
-            position = null;
-        }
-    }
-
-    // ======================
-    // 开仓（修复：必须无持仓）
-    // ======================
-    if(sig === "LONG" && !position){
-
-        position = {
-            entry: next.close
-        };
+    if(sig==="LONG" && !pos){
+        pos={entry:next.close};
     }
 }
 
-// ======================
-// 7. 统计
-// ======================
-let win = trades.filter(x=>x>0).length;
+let win=trades.filter(x=>x>0).length;
 
-let result = `
-【V6 修复版回测】
+lastReport = {
+    capital,
+    returnRate:(capital-300)/300,
+    trades,
+    winRate:win/(trades.length||1),
+    maxDD
+};
+
+document.getElementById("out").innerText = `
+【V6回测结果】
 
 最终资金：${capital.toFixed(2)}
 收益率：${((capital-300)/300*100).toFixed(2)}%
 交易次数：${trades.length}
-胜率：${(win/(win+trades.length-win||1)*100).toFixed(2)}
+胜率：${(win/(trades.length||1)*100).toFixed(2)}%
+最大单笔亏损：${(maxDD*100).toFixed(2)}%
 
-状态：
-✔ 仓位锁
-✔ VOLATILE过滤
-✔ 资金保护
-✔ 防重复交易
+👉 已生成可复制报告
 `;
+}
 
-document.getElementById("out").innerText = result;
+// ================= 一键复制 =================
+function copyReport(){
 
+navigator.clipboard.writeText(JSON.stringify(lastReport,null,2));
+
+alert("📋 已复制回测数据，可以直接发给AI分析");
 }
 
 </script>
