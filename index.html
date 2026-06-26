@@ -1,18 +1,18 @@
 <!DOCTYPE html>
-<html lang="zh">
+<html>
 <head>
 <meta charset="UTF-8">
-<title>V7 回测一键版</title>
+<title>V2 修复版回测</title>
 <style>
-body{background:#0b1220;color:white;font-family:Arial;padding:20px}
-button{padding:12px;width:100%;margin-top:10px}
-pre{background:#162033;padding:10px;border-radius:10px;white-space:pre-wrap}
+body{background:#0b1220;color:#fff;font-family:Arial;padding:20px}
+button{padding:12px;width:100%}
+pre{background:#162033;padding:10px}
 </style>
 </head>
 
 <body>
 
-<h2>🚀 V7 一键回测（简化版）</h2>
+<h2>🚀 V2 修复版回测系统</h2>
 
 <button onclick="run()">开始回测</button>
 
@@ -20,7 +20,6 @@ pre{background:#162033;padding:10px;border-radius:10px;white-space:pre-wrap}
 
 <script>
 
-// ===== 模拟K线 =====
 function gen(){
     let d=[],p=100;
     for(let i=0;i<2000;i++){
@@ -36,24 +35,41 @@ function gen(){
     return d;
 }
 
-// ===== 信号 =====
+// EMA
+function ema(data,period){
+    let k=2/(period+1);
+    let e=data[0];
+    for(let i=1;i<data.length;i++){
+        e=data[i]*k+e*(1-k);
+    }
+    return e;
+}
+
+// ===== V2信号 =====
 function signal(d,i){
+
     if(i<50) return null;
 
     let s=d.slice(i-20,i);
 
-    let high=Math.max(...s.map(x=>x.high));
+    let price=d[i].close;
+
+    let high20=Math.max(...s.map(x=>x.high));
     let volAvg=s.reduce((a,b)=>a+b.vol,0)/s.length;
 
-    let c=d[i];
+    let ema100=ema(s.map(x=>x.close),20);
 
-    // 防插针
-    let body=Math.abs(c.open-c.close);
-    let wick=c.high-Math.max(c.open,c.close);
-    if(wick>body*2.5) return null;
+    // ===== 趋势过滤（核心）=====
+    if(price < ema100) return null;
 
-    // 趋势突破
-    if(c.close>high && c.vol>volAvg*1.2){
+    // ===== 防插针 =====
+    let body=Math.abs(d[i].open-price);
+    let wick=d[i].high-Math.max(d[i].open,price);
+
+    if(wick > body*2.5) return null;
+
+    // ===== 放量突破 =====
+    if(price > high20 && d[i].vol > volAvg*1.2){
         return "LONG";
     }
 
@@ -92,12 +108,24 @@ for(let i=50;i<d.length-1;i++){
 let win=trades.filter(x=>x>0).length;
 let lose=trades.length-win;
 
-document.getElementById("out").innerText=`
+let report = `
+【V2回测报告】
+
 最终资金：${capital.toFixed(2)}
 收益率：${((capital-300)/300*100).toFixed(2)}%
 交易次数：${trades.length}
 胜率：${(win/(win+lose||1)*100).toFixed(2)}%
+
+——可复制给AI分析👇
+${JSON.stringify({
+    capital,
+    returnRate:(capital-300)/300,
+    trades,
+    winRate:win/(win+lose||1)
+},null,2)}
 `;
+
+document.getElementById("out").innerText=report;
 }
 
 </script>
