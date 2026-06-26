@@ -2,21 +2,56 @@
 <html lang="zh">
 <head>
 <meta charset="UTF-8">
-<title>V7.2 标准量化回测引擎</title>
+<title>V7.3 强趋势过滤量化回测引擎</title>
 <style>
-body{background:#0b1220;color:#fff;font-family:Arial;padding:20px}
+body{
+    background:#0b1220;
+    color:#fff;
+    font-family:Arial, sans-serif;
+    padding:20px;
+}
 h2{margin-top:0}
-.card{background:#162033;padding:15px;border-radius:10px;margin:10px 0}
-button,input{padding:10px;margin:6px 0;width:100%;box-sizing:border-box}
-button{background:#f0b90b;border:0;border-radius:6px;font-weight:bold}
-pre{background:#101827;padding:12px;border-radius:10px;white-space:pre-wrap;max-height:520px;overflow:auto}
-label{font-size:14px;color:#ddd}
+.card{
+    background:#162033;
+    padding:15px;
+    border-radius:10px;
+    margin:10px 0;
+}
+button,input{
+    padding:10px;
+    margin:6px 0;
+    width:100%;
+    box-sizing:border-box;
+}
+button{
+    background:#f0b90b;
+    border:0;
+    border-radius:6px;
+    font-weight:bold;
+    cursor:pointer;
+}
+pre{
+    background:#101827;
+    padding:12px;
+    border-radius:10px;
+    white-space:pre-wrap;
+    max-height:620px;
+    overflow:auto;
+}
+label{
+    font-size:14px;
+    color:#ddd;
+}
+.small{
+    color:#aaa;
+    font-size:13px;
+}
 </style>
 </head>
 
 <body>
 
-<h2>🚀 V7.2 标准量化回测引擎</h2>
+<h2>🚀 V7.3 强趋势过滤量化回测引擎</h2>
 
 <div class="card">
 <label>初始资金 USDT</label>
@@ -34,8 +69,11 @@ label{font-size:14px;color:#ddd}
 <label>止盈 %</label>
 <input id="takeProfit" value="3">
 
-<label>最大名义仓位倍数，例如 1 = 不超过本金，2 = 最高2倍名义仓位</label>
+<label>最大名义仓位倍数，1 = 不超过本金</label>
 <input id="maxExposure" value="1">
+
+<label>最大回撤熔断 %</label>
+<input id="maxDDLimit" value="20">
 
 <label>手续费单边 %</label>
 <input id="feePct" value="0.04">
@@ -43,8 +81,18 @@ label{font-size:14px;color:#ddd}
 <label>滑点 %</label>
 <input id="slippagePct" value="0.05">
 
+<label>最低信号评分，建议 4 或 5</label>
+<input id="minScore" value="5">
+
+<label>是否开启 RANGE 震荡策略，0=关闭，1=开启</label>
+<input id="enableRange" value="0">
+
 <button onclick="run()">开始回测</button>
 <button onclick="copyReport()">📋 一键复制报告</button>
+
+<div class="small">
+建议先用默认参数跑。V7.3 默认关闭震荡交易，只保留强趋势信号。
+</div>
 </div>
 
 <div class="card">
@@ -55,13 +103,14 @@ label{font-size:14px;color:#ddd}
 let lastReport = null;
 
 // ==========================
-// 工具函数
+// 基础工具
 // ==========================
 function num(id){
     return Number(document.getElementById(id).value);
 }
 
 function avg(arr){
+    if(!arr.length) return 0;
     return arr.reduce((a,b)=>a+b,0) / arr.length;
 }
 
@@ -78,32 +127,62 @@ function clamp(v, lo, hi){
 }
 
 // ==========================
-// 模拟K线：避免接口问题，先验证引擎
+// 模拟K线生成：趋势 / 震荡 / 高波动
 // ==========================
 function genData(n){
     let d = [];
     let price = 100;
 
     for(let i=0;i<n;i++){
-        // 用百分比波动生成，避免价格变负
-        let regimeBoost = 1;
 
-        // 模拟偶发趋势/高波动段
-        if(i % 3000 > 2200 && i % 3000 < 2600) regimeBoost = 1.8;
-        if(i % 5000 > 4300 && i % 5000 < 4500) regimeBoost = 3.0;
+        let cycle = i % 5000;
+        let drift = 0;
+        let volBoost = 1;
 
-        let ret = (Math.random() - 0.5) * 0.012 * regimeBoost;
+        // 上升趋势段
+        if(cycle >= 500 && cycle < 1700){
+            drift = 0.00045;
+            volBoost = 1.15;
+        }
+
+        // 震荡段
+        if(cycle >= 1700 && cycle < 3000){
+            drift = 0;
+            volBoost = 0.75;
+        }
+
+        // 下降趋势段
+        if(cycle >= 3000 && cycle < 4200){
+            drift = -0.00045;
+            volBoost = 1.15;
+        }
+
+        // 高波动段
+        if(cycle >= 4200){
+            drift = 0;
+            volBoost = 2.6;
+        }
+
+        let noise = (Math.random() - 0.5) * 0.012 * volBoost;
+        let ret = drift + noise;
+
         let open = price;
         let close = Math.max(1, open * (1 + ret));
 
-        let wick = Math.random() * 0.006 * regimeBoost;
+        let wick = Math.random() * 0.006 * volBoost;
         let high = Math.max(open, close) * (1 + wick);
         let low = Math.min(open, close) * (1 - wick);
-        let vol = 100 + Math.random() * 200 * regimeBoost;
+        let volume = 100 + Math.random() * 180 * volBoost;
 
         price = close;
 
-        d.push({open, high, low, close, vol});
+        d.push({
+            open,
+            high,
+            low,
+            close,
+            vol: volume
+        });
     }
 
     return d;
@@ -114,11 +193,12 @@ function genData(n){
 // ==========================
 function ema(values, period){
     if(values.length === 0) return 0;
+
     let k = 2 / (period + 1);
     let e = values[0];
 
     for(let i=1;i<values.length;i++){
-        e = values[i] * k + e * (1-k);
+        e = values[i] * k + e * (1 - k);
     }
 
     return e;
@@ -129,14 +209,15 @@ function atr(data, i, period){
 
     for(let j=i-period+1;j<=i;j++){
         if(j <= 0) continue;
+
         let h = data[j].high;
         let l = data[j].low;
         let pc = data[j-1].close;
 
         trs.push(Math.max(
-            h-l,
-            Math.abs(h-pc),
-            Math.abs(l-pc)
+            h - l,
+            Math.abs(h - pc),
+            Math.abs(l - pc)
         ));
     }
 
@@ -147,31 +228,81 @@ function atr(data, i, period){
 // 市场状态识别
 // ==========================
 function marketState(d, i){
-    let lookback = 100;
-    if(i < lookback) return "UNKNOWN";
+    if(i < 150) return {
+        state:"UNKNOWN",
+        ema20:0,
+        ema80:0,
+        atrPct:0,
+        trendStrength:0,
+        slope:0
+    };
 
-    let slice = d.slice(i-lookback, i);
-    let closes = slice.map(x=>x.close);
+    let s120 = d.slice(i-120, i);
+    let s60 = d.slice(i-60, i);
+    let s30 = d.slice(i-30, i);
 
-    let emaFast = ema(closes, 20);
-    let emaSlow = ema(closes, 80);
+    let closes120 = s120.map(x=>x.close);
+    let closes60 = s60.map(x=>x.close);
+    let closes30 = s30.map(x=>x.close);
+
+    let ema20 = ema(closes120, 20);
+    let ema80 = ema(closes120, 80);
+
+    let ema20Now = ema(closes30, 20);
+    let ema20Past = ema(closes60.slice(0,30), 20);
+
+    let slope = (ema20Now - ema20Past) / d[i].close;
 
     let currentAtr = atr(d, i, 14);
     let atrPct = currentAtr / d[i].close;
 
-    let trendStrength = Math.abs(emaFast - emaSlow) / d[i].close;
+    let trendStrength = Math.abs(ema20 - ema80) / d[i].close;
 
-    if(atrPct > 0.035) return "VOLATILE";
-
-    if(trendStrength > 0.004 && atrPct > 0.003){
-        return "TREND";
+    if(atrPct > 0.035){
+        return {
+            state:"VOLATILE",
+            ema20,
+            ema80,
+            atrPct,
+            trendStrength,
+            slope
+        };
     }
 
-    return "RANGE";
+    if(ema20 > ema80 && slope > 0.0005 && trendStrength > 0.004){
+        return {
+            state:"TREND_UP",
+            ema20,
+            ema80,
+            atrPct,
+            trendStrength,
+            slope
+        };
+    }
+
+    if(ema20 < ema80 && slope < -0.0005 && trendStrength > 0.004){
+        return {
+            state:"TREND_DOWN",
+            ema20,
+            ema80,
+            atrPct,
+            trendStrength,
+            slope
+        };
+    }
+
+    return {
+        state:"RANGE",
+        ema20,
+        ema80,
+        atrPct,
+        trendStrength,
+        slope
+    };
 }
 
 // ==========================
-// 防插针 / 防瀑布
+// 风险过滤：防插针 / 防极端波动
 // ==========================
 function riskFilter(d, i){
     let c = d[i];
@@ -180,13 +311,12 @@ function riskFilter(d, i){
     let upperWick = c.high - Math.max(c.open, c.close);
     let lowerWick = Math.min(c.open, c.close) - c.low;
 
-    // 防插针：影线太夸张，不交易
     if(upperWick / body > 4 || lowerWick / body > 4){
         return false;
     }
 
-    // 防瀑布/暴拉：单根波动太大，不交易
     let rangePct = (c.high - c.low) / c.close;
+
     if(rangePct > 0.035){
         return false;
     }
@@ -195,52 +325,189 @@ function riskFilter(d, i){
 }
 
 // ==========================
-// 策略信号：趋势/震荡自动切换
-// 信号在 i 根K线收盘确认，i+1 开盘执行
+// 信号评分系统
 // ==========================
-function signal(d, i){
-    if(i < 120) return null;
+function scoreTrendLong(d, i, ms){
+    let s20 = d.slice(i-20, i);
+    let s50 = d.slice(i-50, i);
+
+    let price = d[i].close;
+    let prevHigh20 = max(s20.map(x=>x.high));
+    let prevHigh50 = max(s50.map(x=>x.high));
+    let volAvg20 = avg(s20.map(x=>x.vol));
+
+    let score = 0;
+    let reasons = [];
+
+    if(ms.state === "TREND_UP"){
+        score++;
+        reasons.push("TREND_UP");
+    }
+
+    if(price > prevHigh20){
+        score++;
+        reasons.push("突破20高");
+    }
+
+    if(price > prevHigh50 * 0.995){
+        score++;
+        reasons.push("接近/突破50高");
+    }
+
+    if(ms.ema20 > ms.ema80){
+        score++;
+        reasons.push("EMA多头");
+    }
+
+    if(ms.slope > 0.0005){
+        score++;
+        reasons.push("斜率向上");
+    }
+
+    if(d[i].vol > volAvg20 * 1.2){
+        score++;
+        reasons.push("放量");
+    }
+
+    if(ms.atrPct > 0.003 && ms.atrPct < 0.03){
+        score++;
+        reasons.push("ATR正常");
+    }
+
+    return {
+        score,
+        reasons
+    };
+}
+
+function scoreTrendShort(d, i, ms){
+    let s20 = d.slice(i-20, i);
+    let s50 = d.slice(i-50, i);
+
+    let price = d[i].close;
+    let prevLow20 = min(s20.map(x=>x.low));
+    let prevLow50 = min(s50.map(x=>x.low));
+    let volAvg20 = avg(s20.map(x=>x.vol));
+
+    let score = 0;
+    let reasons = [];
+
+    if(ms.state === "TREND_DOWN"){
+        score++;
+        reasons.push("TREND_DOWN");
+    }
+
+    if(price < prevLow20){
+        score++;
+        reasons.push("跌破20低");
+    }
+
+    if(price < prevLow50 * 1.005){
+        score++;
+        reasons.push("接近/跌破50低");
+    }
+
+    if(ms.ema20 < ms.ema80){
+        score++;
+        reasons.push("EMA空头");
+    }
+
+    if(ms.slope < -0.0005){
+        score++;
+        reasons.push("斜率向下");
+    }
+
+    if(d[i].vol > volAvg20 * 1.2){
+        score++;
+        reasons.push("放量");
+    }
+
+    if(ms.atrPct > 0.003 && ms.atrPct < 0.03){
+        score++;
+        reasons.push("ATR正常");
+    }
+
+    return {
+        score,
+        reasons
+    };
+}
+
+// ==========================
+// 可选 RANGE 策略，默认关闭
+// ==========================
+function rangeSignal(d, i){
+    let s20 = d.slice(i-20, i);
+    let mean = avg(s20.map(x=>x.close));
+    let currentAtr = atr(d, i, 14);
+    let price = d[i].close;
+
+    if(price < mean - currentAtr * 1.2){
+        return {
+            direction:"LONG",
+            strategy:"RANGE_LONG",
+            score:3,
+            reasons:["均值回归做多"]
+        };
+    }
+
+    if(price > mean + currentAtr * 1.2){
+        return {
+            direction:"SHORT",
+            strategy:"RANGE_SHORT",
+            score:3,
+            reasons:["均值回归做空"]
+        };
+    }
+
+    return null;
+}
+
+// ==========================
+// 总信号函数
+// 信号在第 i 根K线收盘后确认，下一根K线开盘执行
+// ==========================
+function signal(d, i, params){
+    if(i < 160) return null;
+
     if(!riskFilter(d, i)) return null;
 
-    let state = marketState(d, i);
+    let ms = marketState(d, i);
 
-    if(state === "VOLATILE" || state === "UNKNOWN"){
+    if(ms.state === "UNKNOWN" || ms.state === "VOLATILE"){
         return null;
     }
 
-    let shortSlice = d.slice(i-20, i);
-    let longSlice = d.slice(i-100, i);
+    let longScore = scoreTrendLong(d, i, ms);
+    let shortScore = scoreTrendShort(d, i, ms);
 
-    let price = d[i].close;
-    let prevHigh20 = max(shortSlice.map(x=>x.high));
-    let prevLow20 = min(shortSlice.map(x=>x.low));
-    let volAvg = avg(shortSlice.map(x=>x.vol));
-
-    let ema20 = ema(longSlice.map(x=>x.close), 20);
-    let ema80 = ema(longSlice.map(x=>x.close), 80);
-
-    // 趋势模式：突破交易
-    if(state === "TREND"){
-        if(price > prevHigh20 && ema20 > ema80 && d[i].vol > volAvg * 1.15){
-            return "LONG";
-        }
-
-        if(price < prevLow20 && ema20 < ema80 && d[i].vol > volAvg * 1.15){
-            return "SHORT";
-        }
+    if(longScore.score >= params.minScore && ms.state === "TREND_UP"){
+        return {
+            direction:"LONG",
+            strategy:"TREND_LONG",
+            score:longScore.score,
+            reasons:longScore.reasons,
+            marketState:ms.state
+        };
     }
 
-    // 震荡模式：均值回归，轻仓逻辑由资金模型控制
-    if(state === "RANGE"){
-        let mean = avg(shortSlice.map(x=>x.close));
-        let currentAtr = atr(d, i, 14);
+    if(shortScore.score >= params.minScore && ms.state === "TREND_DOWN"){
+        return {
+            direction:"SHORT",
+            strategy:"TREND_SHORT",
+            score:shortScore.score,
+            reasons:shortScore.reasons,
+            marketState:ms.state
+        };
+    }
 
-        if(price < mean - currentAtr * 0.8){
-            return "LONG";
-        }
-
-        if(price > mean + currentAtr * 0.8){
-            return "SHORT";
+    if(params.enableRange){
+        let r = rangeSignal(d, i);
+        if(r){
+            return {
+                ...r,
+                marketState:ms.state
+            };
         }
     }
 
@@ -253,8 +520,6 @@ function signal(d, i){
 function calcNotional(capital, riskPct, stopLossPct, maxExposure){
     let riskAmount = capital * riskPct;
     let rawNotional = riskAmount / stopLossPct;
-
-    // 关键：限制最大名义仓位，防止仓位无限放大
     let maxNotional = capital * maxExposure;
 
     return Math.min(rawNotional, maxNotional);
@@ -263,7 +528,7 @@ function calcNotional(capital, riskPct, stopLossPct, maxExposure){
 // ==========================
 // 开仓
 // ==========================
-function openPosition(direction, rawPrice, capital, params){
+function openPosition(sig, rawPrice, capital, params){
     let notional = calcNotional(
         capital,
         params.riskPct,
@@ -273,28 +538,31 @@ function openPosition(direction, rawPrice, capital, params){
 
     if(notional <= 0) return null;
 
-    let entry = rawPrice;
+    let entry;
 
-    if(direction === "LONG"){
+    if(sig.direction === "LONG"){
         entry = rawPrice * (1 + params.slippagePct);
     }else{
         entry = rawPrice * (1 - params.slippagePct);
     }
 
-    // 开仓手续费
-    let fee = notional * params.feePct;
+    let openFee = notional * params.feePct;
 
     return {
-        direction,
+        direction:sig.direction,
+        strategy:sig.strategy,
+        score:sig.score,
+        reasons:sig.reasons,
+        marketState:sig.marketState,
         entry,
         notional,
-        openFee: fee,
-        barsHeld: 0
+        openFee,
+        barsHeld:0
     };
 }
 
 // ==========================
-// 检查平仓
+// 平仓判断
 // ==========================
 function checkExit(pos, bar, params){
     pos.barsHeld++;
@@ -309,7 +577,7 @@ function checkExit(pos, bar, params){
         let stop = pos.entry * (1 - sl);
         let take = pos.entry * (1 + tp);
 
-        // 同一根K线同时碰止盈止损，保守按止损
+        // 同一根K线同时碰止损/止盈，保守按止损
         if(bar.low <= stop){
             exitPrice = stop * (1 - params.slippagePct);
             reason = "STOP";
@@ -332,30 +600,29 @@ function checkExit(pos, bar, params){
         }
     }
 
-    // 最长持仓 80 根K线，防止一直不平仓
-    if(!exitPrice && pos.barsHeld >= 80){
+    // 最长持仓，避免一直卡仓位
+    if(!exitPrice && pos.barsHeld >= params.maxBarsHeld){
         exitPrice = bar.close;
         reason = "TIME_EXIT";
     }
 
     if(!exitPrice) return null;
 
-    return {exitPrice, reason};
+    return {
+        exitPrice,
+        reason
+    };
 }
 
 // ==========================
-// 平仓计算：标准PnL
+// 平仓标准PnL计算
 // ==========================
 function closePosition(pos, exitPrice, capital, params){
-    let direction = pos.direction === "LONG" ? 1 : -1;
+    let directionNum = pos.direction === "LONG" ? 1 : -1;
 
-    let pnlPct = direction * (exitPrice - pos.entry) / pos.entry;
-
-    // 标准收益 = 名义仓位 × 价格涨跌幅
+    let pnlPct = directionNum * (exitPrice - pos.entry) / pos.entry;
     let grossPnl = pos.notional * pnlPct;
-
     let closeFee = pos.notional * params.feePct;
-
     let netPnl = grossPnl - pos.openFee - closeFee;
 
     let capitalBefore = capital;
@@ -363,16 +630,68 @@ function closePosition(pos, exitPrice, capital, params){
 
     return {
         capitalAfter,
-        trade: {
-            direction: pos.direction,
-            entry: pos.entry,
-            exit: exitPrice,
-            notional: pos.notional,
+        trade:{
+            direction:pos.direction,
+            strategy:pos.strategy,
+            marketState:pos.marketState,
+            score:pos.score,
+            reasons:pos.reasons,
+            entry:pos.entry,
+            exit:exitPrice,
+            notional:pos.notional,
             pnlPct,
+            grossPnl,
+            openFee:pos.openFee,
+            closeFee,
             netPnl,
-            returnOnCapital: netPnl / capitalBefore
+            returnOnCapital:netPnl / capitalBefore,
+            barsHeld:pos.barsHeld
         }
     };
+}
+
+// ==========================
+// 分策略统计
+// ==========================
+function calcStrategyStats(trades){
+    let map = {};
+
+    for(let t of trades){
+        if(!map[t.strategy]){
+            map[t.strategy] = {
+                count:0,
+                wins:0,
+                losses:0,
+                netPnl:0,
+                grossProfit:0,
+                grossLoss:0,
+                avgScore:0
+            };
+        }
+
+        let s = map[t.strategy];
+
+        s.count++;
+        s.netPnl += t.netPnl;
+        s.avgScore += t.score || 0;
+
+        if(t.netPnl > 0){
+            s.wins++;
+            s.grossProfit += t.netPnl;
+        }else{
+            s.losses++;
+            s.grossLoss += Math.abs(t.netPnl);
+        }
+    }
+
+    for(let k in map){
+        let s = map[k];
+        s.winRate = s.count ? s.wins / s.count : 0;
+        s.profitFactor = s.grossLoss === 0 ? 999 : s.grossProfit / s.grossLoss;
+        s.avgScore = s.count ? s.avgScore / s.count : 0;
+    }
+
+    return map;
 }
 
 // ==========================
@@ -380,18 +699,22 @@ function closePosition(pos, exitPrice, capital, params){
 // ==========================
 function run(){
     let initialCapital = num("initialCapital");
-    let bars = num("bars");
 
     let params = {
-        riskPct: num("riskPct") / 100,
-        stopLossPct: num("stopLoss") / 100,
-        takeProfitPct: num("takeProfit") / 100,
-        maxExposure: num("maxExposure"),
-        feePct: num("feePct") / 100,
-        slippagePct: num("slippagePct") / 100
+        bars:num("bars"),
+        riskPct:num("riskPct") / 100,
+        stopLossPct:num("stopLoss") / 100,
+        takeProfitPct:num("takeProfit") / 100,
+        maxExposure:num("maxExposure"),
+        maxDDLimit:num("maxDDLimit") / 100,
+        feePct:num("feePct") / 100,
+        slippagePct:num("slippagePct") / 100,
+        minScore:num("minScore"),
+        enableRange:num("enableRange") === 1,
+        maxBarsHeld:100
     };
 
-    let d = genData(bars);
+    let d = genData(params.bars);
 
     let capital = initialCapital;
     let peak = initialCapital;
@@ -399,33 +722,44 @@ function run(){
 
     let position = null;
     let trades = [];
-    let equity = [];
 
     let cooldown = 0;
     let consecutiveLoss = 0;
+
     let stoppedReason = "正常完成";
 
-    for(let i=150;i<d.length-1;i++){
+    let skipped = {
+        cooldown:0,
+        volatileOrUnknown:0,
+        noSignal:0
+    };
+
+    for(let i=170;i<d.length-1;i++){
+
         if(capital <= 0){
             capital = 0;
             stoppedReason = "资金归零";
             break;
         }
 
-        if(capital > peak) peak = capital;
+        if(capital > peak){
+            peak = capital;
+        }
 
         let dd = (peak - capital) / peak;
-        if(dd > maxDD) maxDD = dd;
 
-        // 最大回撤熔断：20%
-        if(dd >= 0.20){
-            stoppedReason = "最大回撤超过20%，停止交易";
+        if(dd > maxDD){
+            maxDD = dd;
+        }
+
+        if(dd >= params.maxDDLimit){
+            stoppedReason = "最大回撤超过限制，停止交易";
             break;
         }
 
         let nextBar = d[i+1];
 
-        // 先管理已有仓位
+        // 先处理持仓
         if(position){
             let exit = checkExit(position, nextBar, params);
 
@@ -444,8 +778,9 @@ function run(){
                     consecutiveLoss = 0;
                 }
 
+                // 连亏冷却
                 if(consecutiveLoss >= 3){
-                    cooldown = 30;
+                    cooldown = 40;
                     consecutiveLoss = 0;
                 }
 
@@ -455,25 +790,25 @@ function run(){
 
         if(cooldown > 0){
             cooldown--;
-            equity.push(capital);
+            skipped.cooldown++;
             continue;
         }
 
-        // 无持仓才允许开新仓
+        // 无持仓才允许开仓
         if(!position){
-            let sig = signal(d, i);
+            let sig = signal(d, i, params);
 
             if(sig){
                 position = openPosition(sig, nextBar.open, capital, params);
 
-                // 开仓手续费立即扣除
                 if(position){
+                    // 开仓手续费立即扣除
                     capital -= position.openFee;
                 }
+            }else{
+                skipped.noSignal++;
             }
         }
-
-        equity.push(capital);
     }
 
     let wins = trades.filter(t=>t.netPnl > 0);
@@ -482,30 +817,52 @@ function run(){
     let grossProfit = wins.reduce((a,b)=>a+b.netPnl,0);
     let grossLoss = Math.abs(losses.reduce((a,b)=>a+b.netPnl,0));
 
-    let profitFactor = grossLoss === 0 ? 999 : grossProfit / grossLoss;
     let winRate = trades.length ? wins.length / trades.length : 0;
+    let profitFactor = grossLoss === 0 ? 999 : grossProfit / grossLoss;
 
     let avgWin = wins.length ? grossProfit / wins.length : 0;
     let avgLoss = losses.length ? grossLoss / losses.length : 0;
 
+    let strategyStats = calcStrategyStats(trades);
+
     lastReport = {
-        version: "V7.2 标准量化引擎",
+        version:"V7.3 强趋势过滤量化回测引擎",
         stoppedReason,
         initialCapital,
-        finalCapital: capital,
-        returnRate: (capital - initialCapital) / initialCapital,
-        maxDrawdown: maxDD,
-        tradesCount: trades.length,
+        finalCapital:capital,
+        returnRate:(capital - initialCapital) / initialCapital,
+        maxDrawdown:maxDD,
+        tradesCount:trades.length,
         winRate,
         profitFactor,
         avgWin,
         avgLoss,
         params,
-        lastTrades: trades.slice(-30)
+        strategyStats,
+        skipped,
+        lastTrades:trades.slice(-50)
     };
 
+    let strategyText = "";
+
+    for(let k in strategyStats){
+        let s = strategyStats[k];
+        strategyText += `
+${k}：
+  交易次数：${s.count}
+  胜率：${(s.winRate*100).toFixed(2)}%
+  净收益：${s.netPnl.toFixed(4)}
+  Profit Factor：${s.profitFactor.toFixed(2)}
+  平均评分：${s.avgScore.toFixed(2)}
+`;
+    }
+
+    if(!strategyText){
+        strategyText = "暂无交易";
+    }
+
     document.getElementById("out").innerText =
-`【V7.2 标准量化引擎回测报告】
+`【V7.3 强趋势过滤回测报告】
 
 停止原因：${stoppedReason}
 
@@ -520,20 +877,26 @@ Profit Factor：${profitFactor.toFixed(2)}
 平均盈利：${avgWin.toFixed(4)}
 平均亏损：${avgLoss.toFixed(4)}
 
-参数：
+【分策略统计】
+${strategyText}
+
+【参数】
 单笔风险：${(params.riskPct*100).toFixed(2)}%
 止损：${(params.stopLossPct*100).toFixed(2)}%
 止盈：${(params.takeProfitPct*100).toFixed(2)}%
 最大名义仓位：${params.maxExposure}x
+最大回撤熔断：${(params.maxDDLimit*100).toFixed(2)}%
 手续费：${(params.feePct*100).toFixed(3)}%
 滑点：${(params.slippagePct*100).toFixed(3)}%
+最低信号评分：${params.minScore}
+RANGE策略：${params.enableRange ? "开启" : "关闭"}
 
-说明：
+【说明】
+✔ 默认关闭震荡交易
+✔ 只做强趋势突破
+✔ 信号评分过滤
 ✔ 标准PnL模型
-✔ 仓位上限
-✔ 单笔风险控制
-✔ 手续费/滑点
-✔ 最大回撤熔断
+✔ 分策略统计
 ✔ 一键复制报告
 `;
 }
@@ -547,7 +910,26 @@ function copyReport(){
         return;
     }
 
-    navigator.clipboard.writeText(JSON.stringify(lastReport,null,2));
+    let text = JSON.stringify(lastReport, null, 2);
+
+    if(navigator.clipboard && navigator.clipboard.writeText){
+        navigator.clipboard.writeText(text).then(()=>{
+            alert("已复制，可直接粘贴给ChatGPT分析");
+        }).catch(()=>{
+            fallbackCopy(text);
+        });
+    }else{
+        fallbackCopy(text);
+    }
+}
+
+function fallbackCopy(text){
+    let textarea = document.createElement("textarea");
+    textarea.value = text;
+    document.body.appendChild(textarea);
+    textarea.select();
+    document.execCommand("copy");
+    document.body.removeChild(textarea);
     alert("已复制，可直接粘贴给ChatGPT分析");
 }
 </script>
