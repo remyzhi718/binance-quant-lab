@@ -1,173 +1,555 @@
 <!DOCTYPE html>
-<html>
+<html lang="zh">
 <head>
 <meta charset="UTF-8">
-<title>V7 修复数学模型 + 一键复制</title>
+<title>V7.2 标准量化回测引擎</title>
 <style>
 body{background:#0b1220;color:#fff;font-family:Arial;padding:20px}
-button{padding:10px;margin:5px;width:100%}
-pre{background:#162033;padding:10px;white-space:pre-wrap}
+h2{margin-top:0}
+.card{background:#162033;padding:15px;border-radius:10px;margin:10px 0}
+button,input{padding:10px;margin:6px 0;width:100%;box-sizing:border-box}
+button{background:#f0b90b;border:0;border-radius:6px;font-weight:bold}
+pre{background:#101827;padding:12px;border-radius:10px;white-space:pre-wrap;max-height:520px;overflow:auto}
+label{font-size:14px;color:#ddd}
 </style>
 </head>
 
 <body>
 
-<h2>🚀 V7 修复版（数学正确模型）</h2>
+<h2>🚀 V7.2 标准量化回测引擎</h2>
+
+<div class="card">
+<label>初始资金 USDT</label>
+<input id="initialCapital" value="300">
+
+<label>K线数量</label>
+<input id="bars" value="20000">
+
+<label>单笔风险 %</label>
+<input id="riskPct" value="1">
+
+<label>止损 %</label>
+<input id="stopLoss" value="1.5">
+
+<label>止盈 %</label>
+<input id="takeProfit" value="3">
+
+<label>最大名义仓位倍数，例如 1 = 不超过本金，2 = 最高2倍名义仓位</label>
+<input id="maxExposure" value="1">
+
+<label>手续费单边 %</label>
+<input id="feePct" value="0.04">
+
+<label>滑点 %</label>
+<input id="slippagePct" value="0.05">
 
 <button onclick="run()">开始回测</button>
 <button onclick="copyReport()">📋 一键复制报告</button>
+</div>
 
-<pre id="out">等待...</pre>
+<div class="card">
+<pre id="out">等待回测...</pre>
+</div>
 
 <script>
+let lastReport = null;
 
-let lastReport = {};
+// ==========================
+// 工具函数
+// ==========================
+function num(id){
+    return Number(document.getElementById(id).value);
+}
 
-// ================= 数据 =================
-function gen(){
-    let d=[],p=100;
-    for(let i=0;i<15000;i++){
-        p += (Math.random()-0.5)*2;
-        d.push({
-            open:p,
-            close:p+(Math.random()-0.5),
-            high:p+Math.random(),
-            low:p-Math.random(),
-            vol:Math.random()*100
-        });
+function avg(arr){
+    return arr.reduce((a,b)=>a+b,0) / arr.length;
+}
+
+function max(arr){
+    return Math.max(...arr);
+}
+
+function min(arr){
+    return Math.min(...arr);
+}
+
+function clamp(v, lo, hi){
+    return Math.max(lo, Math.min(hi, v));
+}
+
+// ==========================
+// 模拟K线：避免接口问题，先验证引擎
+// ==========================
+function genData(n){
+    let d = [];
+    let price = 100;
+
+    for(let i=0;i<n;i++){
+        // 用百分比波动生成，避免价格变负
+        let regimeBoost = 1;
+
+        // 模拟偶发趋势/高波动段
+        if(i % 3000 > 2200 && i % 3000 < 2600) regimeBoost = 1.8;
+        if(i % 5000 > 4300 && i % 5000 < 4500) regimeBoost = 3.0;
+
+        let ret = (Math.random() - 0.5) * 0.012 * regimeBoost;
+        let open = price;
+        let close = Math.max(1, open * (1 + ret));
+
+        let wick = Math.random() * 0.006 * regimeBoost;
+        let high = Math.max(open, close) * (1 + wick);
+        let low = Math.min(open, close) * (1 - wick);
+        let vol = 100 + Math.random() * 200 * regimeBoost;
+
+        price = close;
+
+        d.push({open, high, low, close, vol});
     }
+
     return d;
 }
 
-// ================= 市场状态 =================
-function state(d,i){
+// ==========================
+// EMA / ATR
+// ==========================
+function ema(values, period){
+    if(values.length === 0) return 0;
+    let k = 2 / (period + 1);
+    let e = values[0];
 
-    let s=d.slice(i-20,i);
-
-    let range=Math.max(...s.map(x=>x.high))-Math.min(...s.map(x=>x.low));
-
-    if(range>6) return "VOLATILE";
-    if(range<2) return "RANGE";
-    return "TREND";
-}
-
-// ================= 策略 =================
-function signal(d,i){
-
-    let st=state(d,i);
-
-    if(st==="VOLATILE") return null;
-
-    let s=d.slice(i-20,i);
-    let price=d[i].close;
-
-    let high20=Math.max(...s.map(x=>x.high));
-
-    if(st==="TREND"){
-        if(price>high20) return "LONG";
+    for(let i=1;i<values.length;i++){
+        e = values[i] * k + e * (1-k);
     }
 
-    if(st==="RANGE"){
-        let avg=s.reduce((a,b)=>a+b.close,0)/s.length;
-        if(price<avg*0.99) return "LONG";
+    return e;
+}
+
+function atr(data, i, period){
+    let trs = [];
+
+    for(let j=i-period+1;j<=i;j++){
+        if(j <= 0) continue;
+        let h = data[j].high;
+        let l = data[j].low;
+        let pc = data[j-1].close;
+
+        trs.push(Math.max(
+            h-l,
+            Math.abs(h-pc),
+            Math.abs(l-pc)
+        ));
+    }
+
+    return avg(trs);
+}
+
+// ==========================
+// 市场状态识别
+// ==========================
+function marketState(d, i){
+    let lookback = 100;
+    if(i < lookback) return "UNKNOWN";
+
+    let slice = d.slice(i-lookback, i);
+    let closes = slice.map(x=>x.close);
+
+    let emaFast = ema(closes, 20);
+    let emaSlow = ema(closes, 80);
+
+    let currentAtr = atr(d, i, 14);
+    let atrPct = currentAtr / d[i].close;
+
+    let trendStrength = Math.abs(emaFast - emaSlow) / d[i].close;
+
+    if(atrPct > 0.035) return "VOLATILE";
+
+    if(trendStrength > 0.004 && atrPct > 0.003){
+        return "TREND";
+    }
+
+    return "RANGE";
+}
+
+// ==========================
+// 防插针 / 防瀑布
+// ==========================
+function riskFilter(d, i){
+    let c = d[i];
+
+    let body = Math.max(Math.abs(c.open - c.close), c.close * 0.0001);
+    let upperWick = c.high - Math.max(c.open, c.close);
+    let lowerWick = Math.min(c.open, c.close) - c.low;
+
+    // 防插针：影线太夸张，不交易
+    if(upperWick / body > 4 || lowerWick / body > 4){
+        return false;
+    }
+
+    // 防瀑布/暴拉：单根波动太大，不交易
+    let rangePct = (c.high - c.low) / c.close;
+    if(rangePct > 0.035){
+        return false;
+    }
+
+    return true;
+}
+
+// ==========================
+// 策略信号：趋势/震荡自动切换
+// 信号在 i 根K线收盘确认，i+1 开盘执行
+// ==========================
+function signal(d, i){
+    if(i < 120) return null;
+    if(!riskFilter(d, i)) return null;
+
+    let state = marketState(d, i);
+
+    if(state === "VOLATILE" || state === "UNKNOWN"){
+        return null;
+    }
+
+    let shortSlice = d.slice(i-20, i);
+    let longSlice = d.slice(i-100, i);
+
+    let price = d[i].close;
+    let prevHigh20 = max(shortSlice.map(x=>x.high));
+    let prevLow20 = min(shortSlice.map(x=>x.low));
+    let volAvg = avg(shortSlice.map(x=>x.vol));
+
+    let ema20 = ema(longSlice.map(x=>x.close), 20);
+    let ema80 = ema(longSlice.map(x=>x.close), 80);
+
+    // 趋势模式：突破交易
+    if(state === "TREND"){
+        if(price > prevHigh20 && ema20 > ema80 && d[i].vol > volAvg * 1.15){
+            return "LONG";
+        }
+
+        if(price < prevLow20 && ema20 < ema80 && d[i].vol > volAvg * 1.15){
+            return "SHORT";
+        }
+    }
+
+    // 震荡模式：均值回归，轻仓逻辑由资金模型控制
+    if(state === "RANGE"){
+        let mean = avg(shortSlice.map(x=>x.close));
+        let currentAtr = atr(d, i, 14);
+
+        if(price < mean - currentAtr * 0.8){
+            return "LONG";
+        }
+
+        if(price > mean + currentAtr * 0.8){
+            return "SHORT";
+        }
     }
 
     return null;
 }
 
-// ================= 回测（修复版核心） =================
+// ==========================
+// 标准仓位模型
+// ==========================
+function calcNotional(capital, riskPct, stopLossPct, maxExposure){
+    let riskAmount = capital * riskPct;
+    let rawNotional = riskAmount / stopLossPct;
+
+    // 关键：限制最大名义仓位，防止仓位无限放大
+    let maxNotional = capital * maxExposure;
+
+    return Math.min(rawNotional, maxNotional);
+}
+
+// ==========================
+// 开仓
+// ==========================
+function openPosition(direction, rawPrice, capital, params){
+    let notional = calcNotional(
+        capital,
+        params.riskPct,
+        params.stopLossPct,
+        params.maxExposure
+    );
+
+    if(notional <= 0) return null;
+
+    let entry = rawPrice;
+
+    if(direction === "LONG"){
+        entry = rawPrice * (1 + params.slippagePct);
+    }else{
+        entry = rawPrice * (1 - params.slippagePct);
+    }
+
+    // 开仓手续费
+    let fee = notional * params.feePct;
+
+    return {
+        direction,
+        entry,
+        notional,
+        openFee: fee,
+        barsHeld: 0
+    };
+}
+
+// ==========================
+// 检查平仓
+// ==========================
+function checkExit(pos, bar, params){
+    pos.barsHeld++;
+
+    let sl = params.stopLossPct;
+    let tp = params.takeProfitPct;
+
+    let exitPrice = null;
+    let reason = null;
+
+    if(pos.direction === "LONG"){
+        let stop = pos.entry * (1 - sl);
+        let take = pos.entry * (1 + tp);
+
+        // 同一根K线同时碰止盈止损，保守按止损
+        if(bar.low <= stop){
+            exitPrice = stop * (1 - params.slippagePct);
+            reason = "STOP";
+        }else if(bar.high >= take){
+            exitPrice = take * (1 - params.slippagePct);
+            reason = "TAKE";
+        }
+    }
+
+    if(pos.direction === "SHORT"){
+        let stop = pos.entry * (1 + sl);
+        let take = pos.entry * (1 - tp);
+
+        if(bar.high >= stop){
+            exitPrice = stop * (1 + params.slippagePct);
+            reason = "STOP";
+        }else if(bar.low <= take){
+            exitPrice = take * (1 + params.slippagePct);
+            reason = "TAKE";
+        }
+    }
+
+    // 最长持仓 80 根K线，防止一直不平仓
+    if(!exitPrice && pos.barsHeld >= 80){
+        exitPrice = bar.close;
+        reason = "TIME_EXIT";
+    }
+
+    if(!exitPrice) return null;
+
+    return {exitPrice, reason};
+}
+
+// ==========================
+// 平仓计算：标准PnL
+// ==========================
+function closePosition(pos, exitPrice, capital, params){
+    let direction = pos.direction === "LONG" ? 1 : -1;
+
+    let pnlPct = direction * (exitPrice - pos.entry) / pos.entry;
+
+    // 标准收益 = 名义仓位 × 价格涨跌幅
+    let grossPnl = pos.notional * pnlPct;
+
+    let closeFee = pos.notional * params.feePct;
+
+    let netPnl = grossPnl - pos.openFee - closeFee;
+
+    let capitalBefore = capital;
+    let capitalAfter = capital + netPnl;
+
+    return {
+        capitalAfter,
+        trade: {
+            direction: pos.direction,
+            entry: pos.entry,
+            exit: exitPrice,
+            notional: pos.notional,
+            pnlPct,
+            netPnl,
+            returnOnCapital: netPnl / capitalBefore
+        }
+    };
+}
+
+// ==========================
+// 回测主函数
+// ==========================
 function run(){
+    let initialCapital = num("initialCapital");
+    let bars = num("bars");
 
-let d=gen();
+    let params = {
+        riskPct: num("riskPct") / 100,
+        stopLossPct: num("stopLoss") / 100,
+        takeProfitPct: num("takeProfit") / 100,
+        maxExposure: num("maxExposure"),
+        feePct: num("feePct") / 100,
+        slippagePct: num("slippagePct") / 100
+    };
 
-let capital = 300;
-let peak = 300;
+    let d = genData(bars);
 
-let position = null;
-let trades = [];
+    let capital = initialCapital;
+    let peak = initialCapital;
+    let maxDD = 0;
 
-for(let i=50;i<d.length-1;i++){
+    let position = null;
+    let trades = [];
+    let equity = [];
 
-    let sig = signal(d,i);
-    let next = d[i+1];
+    let cooldown = 0;
+    let consecutiveLoss = 0;
+    let stoppedReason = "正常完成";
 
-    // ===== 更新回撤 =====
-    if(capital > peak) peak = capital;
+    for(let i=150;i<d.length-1;i++){
+        if(capital <= 0){
+            capital = 0;
+            stoppedReason = "资金归零";
+            break;
+        }
 
-    let drawdown = (capital - peak) / peak;
+        if(capital > peak) peak = capital;
 
-    // ===== 资金保护 =====
-    if(capital < 50) break;
+        let dd = (peak - capital) / peak;
+        if(dd > maxDD) maxDD = dd;
 
-    // ======================
-    // 持仓管理（修复PnL）
-    // ======================
-    if(position){
+        // 最大回撤熔断：20%
+        if(dd >= 0.20){
+            stoppedReason = "最大回撤超过20%，停止交易";
+            break;
+        }
 
-        let pnl = (next.close - position.entry) / position.entry;
+        let nextBar = d[i+1];
 
-        // ✔ 正确资金更新（核心修复）
-        capital = capital * (1 + pnl * position.size);
+        // 先管理已有仓位
+        if(position){
+            let exit = checkExit(position, nextBar, params);
 
-        trades.push(pnl * position.size);
+            if(exit){
+                let result = closePosition(position, exit.exitPrice, capital, params);
+                capital = result.capitalAfter;
 
-        position = null;
+                result.trade.reason = exit.reason;
+                result.trade.capitalAfter = capital;
+
+                trades.push(result.trade);
+
+                if(result.trade.netPnl < 0){
+                    consecutiveLoss++;
+                }else{
+                    consecutiveLoss = 0;
+                }
+
+                if(consecutiveLoss >= 3){
+                    cooldown = 30;
+                    consecutiveLoss = 0;
+                }
+
+                position = null;
+            }
+        }
+
+        if(cooldown > 0){
+            cooldown--;
+            equity.push(capital);
+            continue;
+        }
+
+        // 无持仓才允许开新仓
+        if(!position){
+            let sig = signal(d, i);
+
+            if(sig){
+                position = openPosition(sig, nextBar.open, capital, params);
+
+                // 开仓手续费立即扣除
+                if(position){
+                    capital -= position.openFee;
+                }
+            }
+        }
+
+        equity.push(capital);
     }
 
-    // ======================
-    // 开仓（修复仓位模型）
-    // ======================
-    if(sig === "LONG" && !position){
+    let wins = trades.filter(t=>t.netPnl > 0);
+    let losses = trades.filter(t=>t.netPnl <= 0);
 
-        let risk = 0.01; // 1%风险
+    let grossProfit = wins.reduce((a,b)=>a+b.netPnl,0);
+    let grossLoss = Math.abs(losses.reduce((a,b)=>a+b.netPnl,0));
 
-        let stopLoss = 0.015;
+    let profitFactor = grossLoss === 0 ? 999 : grossProfit / grossLoss;
+    let winRate = trades.length ? wins.length / trades.length : 0;
 
-        let size = risk / stopLoss; // ✔ 正确仓位
+    let avgWin = wins.length ? grossProfit / wins.length : 0;
+    let avgLoss = losses.length ? grossLoss / losses.length : 0;
 
-        position = {
-            entry: next.close,
-            size: size
-        };
-    }
-}
+    lastReport = {
+        version: "V7.2 标准量化引擎",
+        stoppedReason,
+        initialCapital,
+        finalCapital: capital,
+        returnRate: (capital - initialCapital) / initialCapital,
+        maxDrawdown: maxDD,
+        tradesCount: trades.length,
+        winRate,
+        profitFactor,
+        avgWin,
+        avgLoss,
+        params,
+        lastTrades: trades.slice(-30)
+    };
 
-// ================= 统计 =================
-let win = trades.filter(x => x > 0).length;
+    document.getElementById("out").innerText =
+`【V7.2 标准量化引擎回测报告】
 
-lastReport = {
-    capital,
-    returnRate:(capital-300)/300,
-    trades,
-    winRate:win/(trades.length||1),
-    maxDD:(capital-peak)/peak
-};
+停止原因：${stoppedReason}
 
-document.getElementById("out").innerText = `
-【V7修复版结果】
-
+初始资金：${initialCapital.toFixed(2)}
 最终资金：${capital.toFixed(2)}
-收益率：${((capital-300)/300*100).toFixed(2)}%
+收益率：${(((capital-initialCapital)/initialCapital)*100).toFixed(2)}%
+
+最大回撤：${(maxDD*100).toFixed(2)}%
 交易次数：${trades.length}
-胜率：${(win/(trades.length||1)*100).toFixed(2)}%
-最大回撤：${((capital-peak)/peak*100).toFixed(2)}%
+胜率：${(winRate*100).toFixed(2)}%
+Profit Factor：${profitFactor.toFixed(2)}
+平均盈利：${avgWin.toFixed(4)}
+平均亏损：${avgLoss.toFixed(4)}
 
-✔ 数学模型已修复
-✔ 仓位正确
-✔ PnL正确
-✔ 回撤正确
+参数：
+单笔风险：${(params.riskPct*100).toFixed(2)}%
+止损：${(params.stopLossPct*100).toFixed(2)}%
+止盈：${(params.takeProfitPct*100).toFixed(2)}%
+最大名义仓位：${params.maxExposure}x
+手续费：${(params.feePct*100).toFixed(3)}%
+滑点：${(params.slippagePct*100).toFixed(3)}%
+
+说明：
+✔ 标准PnL模型
+✔ 仓位上限
+✔ 单笔风险控制
+✔ 手续费/滑点
+✔ 最大回撤熔断
+✔ 一键复制报告
 `;
-
 }
 
-// ================= 一键复制 =================
+// ==========================
+// 一键复制
+// ==========================
 function copyReport(){
+    if(!lastReport){
+        alert("请先运行回测");
+        return;
+    }
 
-navigator.clipboard.writeText(JSON.stringify(lastReport,null,2));
-
-alert("📋 已复制回测报告，可直接发给AI分析");
+    navigator.clipboard.writeText(JSON.stringify(lastReport,null,2));
+    alert("已复制，可直接粘贴给ChatGPT分析");
 }
-
 </script>
 
 </body>
