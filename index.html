@@ -2,17 +2,13 @@
 <html lang="zh">
 <head>
 <meta charset="UTF-8">
-<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<meta name="viewport" content="width=device-width,initial-scale=1">
 <title>币安量化实验室 Pro</title>
 <style>
 body{margin:0;background:#070d18;color:#fff;font-family:Arial;padding:16px}
-h1{font-size:30px}
-.card{background:#141e30;border-radius:18px;padding:18px;margin:14px 0}
-label{display:block;margin-top:12px}
-input,select,button{width:100%;padding:12px;margin-top:8px;border-radius:10px;border:0;font-size:16px}
-button{background:#f0b90b;font-weight:bold}
-pre{white-space:pre-wrap;background:#050914;padding:12px;border-radius:12px;font-size:13px}
-.good{color:#3ddc84}.bad{color:#ff5b5b}
+h1{font-size:30px}.card{background:#141e30;border-radius:18px;padding:18px;margin:14px 0}
+label{display:block;margin-top:12px}input,select,button{width:100%;padding:12px;margin-top:8px;border-radius:10px;border:0;font-size:16px}
+button{background:#f0b90b;font-weight:bold}pre{white-space:pre-wrap;background:#050914;padding:12px;border-radius:12px;font-size:13px}
 </style>
 </head>
 <body>
@@ -22,9 +18,7 @@ pre{white-space:pre-wrap;background:#050914;padding:12px;border-radius:12px;font
 <div class="card">
 <label>合约</label>
 <select id="symbol">
-<option>BTCUSDT</option>
-<option>ETHUSDT</option>
-<option>SOLUSDT</option>
+<option>BTCUSDT</option><option>ETHUSDT</option><option>SOLUSDT</option>
 </select>
 
 <label>本金 USDT</label>
@@ -47,6 +41,7 @@ pre{white-space:pre-wrap;background:#050914;padding:12px;border-radius:12px;font
 <input id="takeProfit" value="3.6">
 
 <button onclick="runBacktest()">开始真实回测</button>
+<button onclick="optimize()">AI自动优化参数</button>
 <button onclick="copyResult()">复制结果给ChatGPT</button>
 </div>
 
@@ -56,163 +51,161 @@ pre{white-space:pre-wrap;background:#050914;padding:12px;border-radius:12px;font
 </div>
 
 <script>
-let lastReport="";
+let lastReport="", cachedK=null, cachedSymbol="", cachedLimit=0;
 
 async function getKlines(symbol, limit){
-    const url=`https://fapi.binance.com/fapi/v1/klines?symbol=${symbol}&interval=1m&limit=${limit}`;
-    const res=await fetch(url);
-    const data=await res.json();
-    return data.map(k=>({
-        time:k[0],
-        open:+k[1],
-        high:+k[2],
-        low:+k[3],
-        close:+k[4],
-        volume:+k[5]
-    }));
+  if(cachedK && cachedSymbol===symbol && cachedLimit===limit) return cachedK;
+  let url=`https://fapi.binance.com/fapi/v1/klines?symbol=${symbol}&interval=1m&limit=${limit}`;
+  let res=await fetch(url);
+  let data=await res.json();
+  cachedSymbol=symbol; cachedLimit=limit;
+  cachedK=data.map(k=>({time:k[0],open:+k[1],high:+k[2],low:+k[3],close:+k[4],volume:+k[5]}));
+  return cachedK;
 }
 
-function avg(arr){
-    return arr.reduce((a,b)=>a+b,0)/arr.length;
+function avg(a){return a.reduce((x,y)=>x+y,0)/a.length}
+
+function maxDD(eq){
+  let peak=eq[0],dd=0;
+  for(let v of eq){if(v>peak)peak=v;dd=Math.max(dd,(peak-v)/peak*100)}
+  return dd;
 }
 
-function maxDrawdown(equity){
-    let peak=equity[0], dd=0;
-    for(let v of equity){
-        if(v>peak) peak=v;
-        dd=Math.max(dd,(peak-v)/peak*100);
+function test(k, capital0, strategy, sl, tp){
+  let capital=capital0,pos=null,trades=[],equity=[capital],cool=0;
+  for(let i=30;i<k.length;i++){
+    let c=k[i];
+
+    let spike=(c.high-c.low)/c.close;
+    if(spike>0.025){cool=10;equity.push(capital);continue}
+
+    let drop=(k[i-3].close-c.close)/k[i-3].close;
+    if(drop>0.03){cool=20;equity.push(capital);continue}
+
+    if(cool>0){cool--;equity.push(capital);continue}
+
+    if(pos){
+      let ch=(c.close-pos.entry)/pos.entry;
+      if(ch<=-sl || ch>=tp){
+        let pnl=capital*pos.risk*ch*pos.leverage;
+        capital+=pnl;
+        trades.push(pnl);
+        pos=null;
+      }
+    }else{
+      let closes=k.slice(i-20,i).map(x=>x.close);
+      let vols=k.slice(i-20,i).map(x=>x.volume);
+      let high20=Math.max(...closes), volAvg=avg(vols);
+      let signal=false;
+
+      if(strategy==="trend") signal=c.close>high20 && c.volume>volAvg*1.3;
+      if(strategy==="waterfall"){
+        let recentDrop=(k[i-5].close-c.close)/k[i-5].close;
+        signal=recentDrop>0.02 && c.close>k[i-1].close;
+      }
+      if(strategy==="vol") signal=c.volume>volAvg*3 && c.close>k[i-1].close;
+
+      if(signal) pos={entry:c.close,leverage:3,risk:0.25};
     }
-    return dd;
+    equity.push(capital);
+  }
+
+  let wins=trades.filter(x=>x>0).length;
+  let losses=trades.filter(x=>x<=0).length;
+  return {
+    final:capital,
+    ret:(capital/capital0-1)*100,
+    dd:maxDD(equity),
+    trades:trades.length,
+    winRate:trades.length?wins/trades.length*100:0,
+    wins,losses,sl,tp
+  };
 }
 
 async function runBacktest(){
-    const symbol=document.getElementById("symbol").value;
-    const capital0=+document.getElementById("capital").value;
-    const limit=+document.getElementById("limit").value;
-    const strategy=document.getElementById("strategy").value;
-    const stopLoss=+document.getElementById("stopLoss").value/100;
-    const takeProfit=+document.getElementById("takeProfit").value/100;
+  let symbol=document.getElementById("symbol").value;
+  let capital=+document.getElementById("capital").value;
+  let limit=+document.getElementById("limit").value;
+  let strategy=document.getElementById("strategy").value;
+  let sl=+document.getElementById("stopLoss").value/100;
+  let tp=+document.getElementById("takeProfit").value/100;
 
-    document.getElementById("result").innerText="正在拉取币安真实K线，请稍等...";
+  document.getElementById("result").innerText="正在拉取币安真实K线...";
+  let k=await getKlines(symbol,limit);
+  let r=test(k,capital,strategy,sl,tp);
 
-    let k;
-    try{
-        k=await getKlines(symbol, limit);
-    }catch(e){
-        document.getElementById("result").innerText="拉取失败，可能是网络或币安接口被限制。";
-        return;
-    }
-
-    let capital=capital0;
-    let position=null;
-    let trades=[];
-    let equity=[capital];
-    let cooldown=0;
-
-    for(let i=30;i<k.length;i++){
-        let c=k[i];
-
-        // 防插针：单根K线振幅超过2.5%，跳过
-        let spike=(c.high-c.low)/c.close;
-        if(spike>0.025){
-            cooldown=10;
-            equity.push(capital);
-            continue;
-        }
-
-        // 防瀑布：3分钟跌幅超过3%，暂停20根K线
-        let drop=(k[i-3].close-c.close)/k[i-3].close;
-        if(drop>0.03){
-            cooldown=20;
-            equity.push(capital);
-            continue;
-        }
-
-        if(cooldown>0){
-            cooldown--;
-            equity.push(capital);
-            continue;
-        }
-
-        if(position){
-            let change=(c.close-position.entry)/position.entry;
-
-            if(change<=-stopLoss || change>=takeProfit){
-                let pnl=capital*position.risk*change*position.leverage;
-                capital+=pnl;
-                trades.push(pnl);
-                position=null;
-            }
-        }else{
-            let closes=k.slice(i-20,i).map(x=>x.close);
-            let vols=k.slice(i-20,i).map(x=>x.volume);
-            let high20=Math.max(...closes);
-            let low20=Math.min(...closes);
-            let volAvg=avg(vols);
-
-            let signal=false;
-
-            if(strategy==="trend"){
-                signal=c.close>high20 && c.volume>volAvg*1.8;
-            }
-
-            if(strategy==="waterfall"){
-                let recentDrop=(k[i-5].close-c.close)/k[i-5].close;
-                signal=recentDrop>0.025 && c.close>k[i-1].close;
-            }
-
-            if(strategy==="vol"){
-                signal=c.volume>volAvg*4 && c.close>k[i-1].close;
-            }
-
-            if(signal){
-                position={
-                    entry:c.close,
-                    leverage:3,
-                    risk:0.25
-                };
-            }
-        }
-
-        equity.push(capital);
-    }
-
-    let wins=trades.filter(x=>x>0).length;
-    let losses=trades.filter(x=>x<=0).length;
-    let winRate=trades.length?wins/trades.length*100:0;
-    let profitRate=(capital/capital0-1)*100;
-    let dd=maxDrawdown(equity);
-
-    lastReport=
-`【币安量化实验室真实回测报告】
-
+  lastReport=`【单组参数回测】
 合约：${symbol}
+策略：${strategy}
+K线：${limit}
+本金：${capital} USDT
+止损：${(sl*100).toFixed(2)}%
+止盈：${(tp*100).toFixed(2)}%
+
+最终资金：${r.final.toFixed(2)} USDT
+收益率：${r.ret.toFixed(2)}%
+最大回撤：${r.dd.toFixed(2)}%
+交易次数：${r.trades}
+胜率：${r.winRate.toFixed(2)}%
+盈利单：${r.wins}
+亏损单：${r.losses}`;
+
+  document.getElementById("result").innerText=lastReport;
+}
+
+async function optimize(){
+  let symbol=document.getElementById("symbol").value;
+  let capital=+document.getElementById("capital").value;
+  let limit=+document.getElementById("limit").value;
+  let strategy=document.getElementById("strategy").value;
+
+  document.getElementById("result").innerText="AI正在自动测试多组参数...";
+  let k=await getKlines(symbol,limit);
+
+  let sls=[0.005,0.008,0.01,0.012,0.015];
+  let tps=[0.01,0.015,0.02,0.025,0.03,0.036,0.05];
+
+  let results=[];
+  for(let sl of sls){
+    for(let tp of tps){
+      let r=test(k,capital,strategy,sl,tp);
+      r.score=r.ret-r.dd*0.7;
+      results.push(r);
+    }
+  }
+
+  results.sort((a,b)=>b.score-a.score);
+  let best=results[0];
+  let top=results.slice(0,8);
+
+  lastReport=`【AI自动优化参数报告】
+合约：${symbol}
+策略：${strategy}
 K线周期：1分钟
 K线数量：${limit}
-本金：${capital0} USDT
-策略：${strategy}
-止损：${(stopLoss*100).toFixed(2)}%
-止盈：${(takeProfit*100).toFixed(2)}%
+本金：${capital} USDT
 
-最终资金：${capital.toFixed(2)} USDT
-收益率：${profitRate.toFixed(2)}%
-最大回撤：${dd.toFixed(2)}%
-交易次数：${trades.length}
-胜率：${winRate.toFixed(2)}%
-盈利单：${wins}
-亏损单：${losses}
+最佳参数：
+止损：${(best.sl*100).toFixed(2)}%
+止盈：${(best.tp*100).toFixed(2)}%
+最终资金：${best.final.toFixed(2)} USDT
+收益率：${best.ret.toFixed(2)}%
+最大回撤：${best.dd.toFixed(2)}%
+交易次数：${best.trades}
+胜率：${best.winRate.toFixed(2)}%
+综合评分：${best.score.toFixed(2)}
 
-防插针：单根1分钟K线振幅 > 2.5% 暂停
-防瀑布：3分钟跌幅 > 3% 暂停20根K线
+前8组结果：
+${top.map((r,i)=>`${i+1}. SL ${(r.sl*100).toFixed(2)}% / TP ${(r.tp*100).toFixed(2)}% | 收益 ${r.ret.toFixed(2)}% | 回撤 ${r.dd.toFixed(2)}% | 交易 ${r.trades} | 胜率 ${r.winRate.toFixed(1)}%`).join("\n")}
 
-请帮我分析这个策略是否适合300U合约进攻账户，并给出参数优化建议。`;
+请帮我分析：这组参数是否适合300U合约进攻账户？是否应该继续扩大K线数量到20000，并如何优化防插针/防瀑布？`;
 
-    document.getElementById("result").innerText=lastReport;
+  document.getElementById("result").innerText=lastReport;
 }
 
 function copyResult(){
-    navigator.clipboard.writeText(lastReport);
-    alert("已复制，可以发给ChatGPT分析");
+  navigator.clipboard.writeText(lastReport);
+  alert("已复制，可以发给ChatGPT分析");
 }
 </script>
 
