@@ -2,7 +2,7 @@
 <html lang="zh">
 <head>
 <meta charset="UTF-8">
-<title>V7.3.1 强趋势过滤量化回测引擎</title>
+<title>V7.4 降噪稳定版量化回测引擎</title>
 <style>
 body{
     background:#0b1220;
@@ -35,7 +35,7 @@ pre{
     padding:12px;
     border-radius:10px;
     white-space:pre-wrap;
-    max-height:650px;
+    max-height:680px;
     overflow:auto;
 }
 label{
@@ -51,17 +51,21 @@ label{
 
 <body>
 
-<h2>🚀 V7.3.1 强趋势过滤回测引擎</h2>
+<h2>🚀 V7.4 降噪稳定版量化回测引擎</h2>
 
 <div class="card">
+
 <label>初始资金 USDT</label>
 <input id="initialCapital" value="300">
 
 <label>K线数量</label>
 <input id="bars" value="20000">
 
-<label>随机种子，相同种子结果可复现</label>
+<label>随机种子，单次回测用</label>
 <input id="seed" value="42">
+
+<label>多种子测试数量</label>
+<input id="multiCount" value="20">
 
 <label>单笔风险 %</label>
 <input id="riskPct" value="1">
@@ -75,8 +79,8 @@ label{
 <label>最大名义仓位倍数，1 = 不超过本金</label>
 <input id="maxExposure" value="1">
 
-<label>最大回撤熔断 %</label>
-<input id="maxDDLimit" value="20">
+<label>最大回撤熔断 %，建议 15~20</label>
+<input id="maxDDLimit" value="15">
 
 <label>手续费单边 %</label>
 <input id="feePct" value="0.04">
@@ -84,18 +88,41 @@ label{
 <label>滑点 %</label>
 <input id="slippagePct" value="0.05">
 
-<label>最低信号评分，建议 5</label>
-<input id="minScore" value="5">
+<label>是否开启 TREND_LONG，1=开启，0=关闭</label>
+<input id="enableLong" value="1">
+
+<label>TREND_LONG 最低评分，建议 6</label>
+<input id="minScoreLong" value="6">
+
+<label>是否开启 TREND_SHORT，1=开启，0=关闭</label>
+<input id="enableShort" value="0">
+
+<label>TREND_SHORT 最低评分，建议 7</label>
+<input id="minScoreShort" value="7">
 
 <label>是否开启 RANGE 震荡策略，0=关闭，1=开启</label>
 <input id="enableRange" value="0">
 
-<button onclick="run()">开始回测</button>
+<label>追高/追空过滤 %，价格距离EMA20过远不追</label>
+<input id="maxChasePct" value="2.5">
+
+<label>每笔交易结束后的冷却K线数</label>
+<input id="tradeCooldown" value="12">
+
+<label>连续亏损触发冷却笔数</label>
+<input id="lossStreakLimit" value="3">
+
+<label>连续亏损后的冷却K线数</label>
+<input id="lossCooldown" value="60">
+
+<button onclick="runSingle()">开始单次回测</button>
+<button onclick="runMultiSeed()">开始多种子测试</button>
 <button onclick="copyReport()">📋 一键复制报告</button>
 
 <div class="small">
-V7.3.1 已修复手续费双扣：开仓时不再提前扣 openFee，统一在平仓时扣 openFee + closeFee。
+V7.4 默认只做 TREND_LONG，关闭 SHORT 和 RANGE，用来降低噪音、减少手续费、提升稳定性。
 </div>
+
 </div>
 
 <div class="card">
@@ -138,7 +165,8 @@ function mulberry32(seed){
 }
 
 // ==========================
-// 模拟K线生成：趋势 / 震荡 / 高波动
+// 模拟K线生成
+// 趋势 / 震荡 / 高波动
 // ==========================
 function genData(n, seed){
     let rnd = mulberry32(seed);
@@ -151,21 +179,25 @@ function genData(n, seed){
         let drift = 0;
         let volBoost = 1;
 
+        // 上涨趋势段
         if(cycle >= 500 && cycle < 1700){
             drift = 0.00045;
             volBoost = 1.15;
         }
 
+        // 震荡段
         if(cycle >= 1700 && cycle < 3000){
             drift = 0;
             volBoost = 0.75;
         }
 
+        // 下跌趋势段
         if(cycle >= 3000 && cycle < 4200){
             drift = -0.00045;
             volBoost = 1.15;
         }
 
+        // 高波动段
         if(cycle >= 4200){
             drift = 0;
             volBoost = 2.6;
@@ -206,7 +238,7 @@ function ema(values, period){
     let e = values[0];
 
     for(let i=1;i<values.length;i++){
-        e = values[i] * k + e * (1 - k);
+        e = values[i] * k + e * (1-k);
     }
 
     return e;
@@ -223,9 +255,9 @@ function atr(data, i, period){
         let pc = data[j-1].close;
 
         trs.push(Math.max(
-            h - l,
-            Math.abs(h - pc),
-            Math.abs(l - pc)
+            h-l,
+            Math.abs(h-pc),
+            Math.abs(l-pc)
         ));
     }
 
@@ -310,7 +342,7 @@ function marketState(d, i){
 }
 
 // ==========================
-// 风险过滤：防插针 / 防极端波动
+// 风险过滤
 // ==========================
 function riskFilter(d, i){
     let c = d[i];
@@ -319,10 +351,12 @@ function riskFilter(d, i){
     let upperWick = c.high - Math.max(c.open, c.close);
     let lowerWick = Math.min(c.open, c.close) - c.low;
 
+    // 防插针
     if(upperWick / body > 4 || lowerWick / body > 4){
         return false;
     }
 
+    // 防单根极端波动
     let rangePct = (c.high - c.low) / c.close;
 
     if(rangePct > 0.035){
@@ -333,7 +367,7 @@ function riskFilter(d, i){
 }
 
 // ==========================
-// 信号评分系统
+// 评分系统：TREND_LONG
 // ==========================
 function scoreTrendLong(d, i, ms){
     let s20 = d.slice(i-20, i);
@@ -388,6 +422,9 @@ function scoreTrendLong(d, i, ms){
     };
 }
 
+// ==========================
+// 评分系统：TREND_SHORT
+// ==========================
 function scoreTrendShort(d, i, ms){
     let s20 = d.slice(i-20, i);
     let s50 = d.slice(i-50, i);
@@ -442,7 +479,7 @@ function scoreTrendShort(d, i, ms){
 }
 
 // ==========================
-// 可选 RANGE 策略，默认关闭
+// RANGE策略，默认关闭
 // ==========================
 function rangeSignal(d, i){
     let s20 = d.slice(i-20, i);
@@ -473,7 +510,8 @@ function rangeSignal(d, i){
 
 // ==========================
 // 总信号函数
-// 信号在第 i 根K线收盘后确认，下一根K线开盘执行
+// 信号在第 i 根K线收盘确认
+// 下一根K线开盘执行
 // ==========================
 function signal(d, i, params){
     if(i < 160) return null;
@@ -486,31 +524,56 @@ function signal(d, i, params){
         return null;
     }
 
-    let longScore = scoreTrendLong(d, i, ms);
-    let shortScore = scoreTrendShort(d, i, ms);
+    let price = d[i].close;
 
-    if(longScore.score >= params.minScore && ms.state === "TREND_UP"){
-        return {
-            direction:"LONG",
-            strategy:"TREND_LONG",
-            score:longScore.score,
-            reasons:longScore.reasons,
-            marketState:ms.state
-        };
+    // TREND_LONG
+    if(params.enableLong && ms.state === "TREND_UP"){
+        let longScore = scoreTrendLong(d, i, ms);
+
+        let chasePct = (price - ms.ema20) / price;
+
+        if(
+            longScore.score >= params.minScoreLong &&
+            chasePct <= params.maxChasePct
+        ){
+            return {
+                direction:"LONG",
+                strategy:"TREND_LONG",
+                score:longScore.score,
+                reasons:longScore.reasons.concat([
+                    "追高距离：" + (chasePct*100).toFixed(2) + "%"
+                ]),
+                marketState:ms.state
+            };
+        }
     }
 
-    if(shortScore.score >= params.minScore && ms.state === "TREND_DOWN"){
-        return {
-            direction:"SHORT",
-            strategy:"TREND_SHORT",
-            score:shortScore.score,
-            reasons:shortScore.reasons,
-            marketState:ms.state
-        };
+    // TREND_SHORT
+    if(params.enableShort && ms.state === "TREND_DOWN"){
+        let shortScore = scoreTrendShort(d, i, ms);
+
+        let chasePct = (ms.ema20 - price) / price;
+
+        if(
+            shortScore.score >= params.minScoreShort &&
+            chasePct <= params.maxChasePct
+        ){
+            return {
+                direction:"SHORT",
+                strategy:"TREND_SHORT",
+                score:shortScore.score,
+                reasons:shortScore.reasons.concat([
+                    "追空距离：" + (chasePct*100).toFixed(2) + "%"
+                ]),
+                marketState:ms.state
+            };
+        }
     }
 
+    // RANGE
     if(params.enableRange){
         let r = rangeSignal(d, i);
+
         if(r){
             return {
                 ...r,
@@ -523,7 +586,7 @@ function signal(d, i, params){
 }
 
 // ==========================
-// 标准仓位模型
+// 仓位模型
 // ==========================
 function calcNotional(capital, riskPct, stopLossPct, maxExposure){
     let riskAmount = capital * riskPct;
@@ -621,9 +684,19 @@ function checkExit(pos, bar, params){
 }
 
 // ==========================
-// 平仓标准PnL计算
-// 手续费修复点：
-// openFee 只在这里扣一次，不在开仓时提前扣。
+// 强制最终平仓
+// ==========================
+function finalExitPrice(pos, rawPrice, params){
+    if(pos.direction === "LONG"){
+        return rawPrice * (1 - params.slippagePct);
+    }
+
+    return rawPrice * (1 + params.slippagePct);
+}
+
+// ==========================
+// 平仓PnL计算
+// 手续费只在这里统一扣一次
 // ==========================
 function closePosition(pos, exitPrice, capital, params){
     let directionNum = pos.direction === "LONG" ? 1 : -1;
@@ -631,7 +704,6 @@ function closePosition(pos, exitPrice, capital, params){
     let pnlPct = directionNum * (exitPrice - pos.entry) / pos.entry;
     let grossPnl = pos.notional * pnlPct;
     let closeFee = pos.notional * params.feePct;
-
     let totalFee = pos.openFee + closeFee;
     let netPnl = grossPnl - totalFee;
 
@@ -676,7 +748,8 @@ function calcStrategyStats(trades){
                 netPnl:0,
                 grossProfit:0,
                 grossLoss:0,
-                avgScore:0
+                avgScore:0,
+                avgBarsHeld:0
             };
         }
 
@@ -685,6 +758,7 @@ function calcStrategyStats(trades){
         s.count++;
         s.netPnl += t.netPnl;
         s.avgScore += t.score || 0;
+        s.avgBarsHeld += t.barsHeld || 0;
 
         if(t.netPnl > 0){
             s.wins++;
@@ -697,23 +771,25 @@ function calcStrategyStats(trades){
 
     for(let k in map){
         let s = map[k];
+
         s.winRate = s.count ? s.wins / s.count : 0;
         s.profitFactor = s.grossLoss === 0 ? 999 : s.grossProfit / s.grossLoss;
         s.avgScore = s.count ? s.avgScore / s.count : 0;
+        s.avgBarsHeld = s.count ? s.avgBarsHeld / s.count : 0;
     }
 
     return map;
 }
 
 // ==========================
-// 回测主函数
+// 参数读取
 // ==========================
-function run(){
-    let initialCapital = num("initialCapital");
-
-    let params = {
+function readParams(){
+    return {
+        initialCapital:num("initialCapital"),
         bars:num("bars"),
         seed:num("seed"),
+
         riskPct:num("riskPct") / 100,
         stopLossPct:num("stopLoss") / 100,
         takeProfitPct:num("takeProfit") / 100,
@@ -721,15 +797,33 @@ function run(){
         maxDDLimit:num("maxDDLimit") / 100,
         feePct:num("feePct") / 100,
         slippagePct:num("slippagePct") / 100,
-        minScore:num("minScore"),
+
+        enableLong:num("enableLong") === 1,
+        minScoreLong:num("minScoreLong"),
+
+        enableShort:num("enableShort") === 1,
+        minScoreShort:num("minScoreShort"),
+
         enableRange:num("enableRange") === 1,
+
+        maxChasePct:num("maxChasePct") / 100,
+
+        tradeCooldown:num("tradeCooldown"),
+        lossStreakLimit:num("lossStreakLimit"),
+        lossCooldown:num("lossCooldown"),
+
         maxBarsHeld:100
     };
+}
 
+// ==========================
+// 单次回测核心
+// ==========================
+function backtestOnce(params){
     let d = genData(params.bars, params.seed);
 
-    let capital = initialCapital;
-    let peak = initialCapital;
+    let capital = params.initialCapital;
+    let peak = params.initialCapital;
     let maxDD = 0;
 
     let position = null;
@@ -776,7 +870,7 @@ function run(){
 
         let nextBar = d[i+1];
 
-        // 先处理持仓
+        // 先管理持仓
         if(position){
             let exit = checkExit(position, nextBar, params);
 
@@ -786,6 +880,7 @@ function run(){
 
                 result.trade.reason = exit.reason;
                 result.trade.capitalAfter = capital;
+                result.trade.seed = params.seed;
 
                 trades.push(result.trade);
 
@@ -795,8 +890,10 @@ function run(){
                     consecutiveLoss = 0;
                 }
 
-                if(consecutiveLoss >= 3){
-                    cooldown = 40;
+                cooldown = Math.max(cooldown, params.tradeCooldown);
+
+                if(consecutiveLoss >= params.lossStreakLimit){
+                    cooldown = Math.max(cooldown, params.lossCooldown);
                     consecutiveLoss = 0;
                 }
 
@@ -823,14 +920,27 @@ function run(){
 
             if(sig){
                 position = openPosition(sig, nextBar.open, capital, params);
-
-                // 关键修复：
-                // 这里不再执行 capital -= position.openFee;
-                // 开仓手续费统一在平仓时和closeFee一起扣除。
             }else{
                 skipped.noSignal++;
             }
         }
+    }
+
+    // 最后一根K线强制平仓，避免未实现盈亏遗漏
+    if(position && capital > 0){
+        let lastBar = d[d.length-1];
+        let exitPrice = finalExitPrice(position, lastBar.close, params);
+        let result = closePosition(position, exitPrice, capital, params);
+
+        capital = result.capitalAfter;
+
+        result.trade.reason = "FINAL_EXIT";
+        result.trade.capitalAfter = capital;
+        result.trade.seed = params.seed;
+
+        trades.push(result.trade);
+
+        updateDrawdown();
     }
 
     let wins = trades.filter(t=>t.netPnl > 0);
@@ -844,18 +954,17 @@ function run(){
 
     let avgWin = wins.length ? grossProfit / wins.length : 0;
     let avgLoss = losses.length ? grossLoss / losses.length : 0;
-
     let totalFees = trades.reduce((a,b)=>a+b.totalFee,0);
 
     let strategyStats = calcStrategyStats(trades);
 
-    lastReport = {
-        version:"V7.3.1 强趋势过滤量化回测引擎_手续费修复版",
-        feeBugFixed:true,
+    return {
+        version:"V7.4 降噪稳定版",
         stoppedReason,
-        initialCapital,
+        seed:params.seed,
+        initialCapital:params.initialCapital,
         finalCapital:capital,
-        returnRate:(capital - initialCapital) / initialCapital,
+        returnRate:(capital - params.initialCapital) / params.initialCapital,
         maxDrawdown:maxDD,
         tradesCount:trades.length,
         winRate,
@@ -863,16 +972,106 @@ function run(){
         avgWin,
         avgLoss,
         totalFees,
-        params,
         strategyStats,
         skipped,
+        params,
         lastTrades:trades.slice(-50)
     };
+}
 
+// ==========================
+// 单次回测按钮
+// ==========================
+function runSingle(){
+    let params = readParams();
+
+    let report = backtestOnce(params);
+
+    lastReport = report;
+
+    displaySingleReport(report);
+}
+
+// ==========================
+// 多种子测试按钮
+// ==========================
+function runMultiSeed(){
+    let base = readParams();
+    let count = num("multiCount");
+
+    let reports = [];
+
+    for(let i=0;i<count;i++){
+        let p = {
+            ...base,
+            seed:base.seed + i
+        };
+
+        reports.push(backtestOnce(p));
+    }
+
+    let avgReturn = avg(reports.map(r=>r.returnRate));
+    let avgDD = avg(reports.map(r=>r.maxDrawdown));
+    let avgPF = avg(reports.map(r=>r.profitFactor >= 999 ? 10 : r.profitFactor));
+    let avgTrades = avg(reports.map(r=>r.tradesCount));
+
+    let positiveRuns = reports.filter(r=>r.returnRate > 0).length;
+    let stoppedByDD = reports.filter(r=>r.stoppedReason.includes("最大回撤")).length;
+
+    let best = reports.reduce((a,b)=>a.returnRate > b.returnRate ? a : b);
+    let worst = reports.reduce((a,b)=>a.returnRate < b.returnRate ? a : b);
+
+    let summaries = reports.map(r=>({
+        seed:r.seed,
+        finalCapital:r.finalCapital,
+        returnRate:r.returnRate,
+        maxDrawdown:r.maxDrawdown,
+        tradesCount:r.tradesCount,
+        winRate:r.winRate,
+        profitFactor:r.profitFactor,
+        stoppedReason:r.stoppedReason
+    }));
+
+    lastReport = {
+        version:"V7.4 降噪稳定版_多种子测试",
+        runs:count,
+        aggregate:{
+            avgReturn,
+            avgDrawdown:avgDD,
+            avgProfitFactor:avgPF,
+            avgTrades,
+            positiveRuns,
+            positiveRate:positiveRuns / count,
+            stoppedByDD,
+            best:{
+                seed:best.seed,
+                returnRate:best.returnRate,
+                finalCapital:best.finalCapital,
+                profitFactor:best.profitFactor
+            },
+            worst:{
+                seed:worst.seed,
+                returnRate:worst.returnRate,
+                finalCapital:worst.finalCapital,
+                profitFactor:worst.profitFactor
+            }
+        },
+        params:base,
+        summaries
+    };
+
+    displayMultiReport(lastReport);
+}
+
+// ==========================
+// 展示单次报告
+// ==========================
+function displaySingleReport(r){
     let strategyText = "";
 
-    for(let k in strategyStats){
-        let s = strategyStats[k];
+    for(let k in r.strategyStats){
+        let s = r.strategyStats[k];
+
         strategyText += `
 ${k}：
   交易次数：${s.count}
@@ -880,6 +1079,7 @@ ${k}：
   净收益：${s.netPnl.toFixed(4)}
   Profit Factor：${s.profitFactor.toFixed(2)}
   平均评分：${s.avgScore.toFixed(2)}
+  平均持仓K线：${s.avgBarsHeld.toFixed(2)}
 `;
     }
 
@@ -888,45 +1088,100 @@ ${k}：
     }
 
     document.getElementById("out").innerText =
-`【V7.3.1 手续费修复版回测报告】
+`【V7.4 降噪稳定版单次回测报告】
 
-停止原因：${stoppedReason}
+停止原因：${r.stoppedReason}
 
-初始资金：${initialCapital.toFixed(2)}
-最终资金：${capital.toFixed(2)}
-收益率：${(((capital-initialCapital)/initialCapital)*100).toFixed(2)}%
+随机种子：${r.seed}
+初始资金：${r.initialCapital.toFixed(2)}
+最终资金：${r.finalCapital.toFixed(2)}
+收益率：${(r.returnRate*100).toFixed(2)}%
 
-最大回撤：${(maxDD*100).toFixed(2)}%
-交易次数：${trades.length}
-胜率：${(winRate*100).toFixed(2)}%
-Profit Factor：${profitFactor.toFixed(2)}
-平均盈利：${avgWin.toFixed(4)}
-平均亏损：${avgLoss.toFixed(4)}
-总手续费：${totalFees.toFixed(4)}
+最大回撤：${(r.maxDrawdown*100).toFixed(2)}%
+交易次数：${r.tradesCount}
+胜率：${(r.winRate*100).toFixed(2)}%
+Profit Factor：${r.profitFactor.toFixed(2)}
+平均盈利：${r.avgWin.toFixed(4)}
+平均亏损：${r.avgLoss.toFixed(4)}
+总手续费：${r.totalFees.toFixed(4)}
 
 【分策略统计】
 ${strategyText}
 
 【参数】
-随机种子：${params.seed}
-单笔风险：${(params.riskPct*100).toFixed(2)}%
-止损：${(params.stopLossPct*100).toFixed(2)}%
-止盈：${(params.takeProfitPct*100).toFixed(2)}%
-最大名义仓位：${params.maxExposure}x
-最大回撤熔断：${(params.maxDDLimit*100).toFixed(2)}%
-手续费：${(params.feePct*100).toFixed(3)}%
-滑点：${(params.slippagePct*100).toFixed(3)}%
-最低信号评分：${params.minScore}
-RANGE策略：${params.enableRange ? "开启" : "关闭"}
+单笔风险：${(r.params.riskPct*100).toFixed(2)}%
+止损：${(r.params.stopLossPct*100).toFixed(2)}%
+止盈：${(r.params.takeProfitPct*100).toFixed(2)}%
+最大名义仓位：${r.params.maxExposure}x
+最大回撤熔断：${(r.params.maxDDLimit*100).toFixed(2)}%
+手续费：${(r.params.feePct*100).toFixed(3)}%
+滑点：${(r.params.slippagePct*100).toFixed(3)}%
 
-【修复说明】
-✔ 已修复手续费双扣
-✔ 开仓时不再提前扣 openFee
-✔ 平仓时统一扣 openFee + closeFee
-✔ 保留强趋势过滤
+TREND_LONG：${r.params.enableLong ? "开启" : "关闭"}
+LONG最低评分：${r.params.minScoreLong}
+
+TREND_SHORT：${r.params.enableShort ? "开启" : "关闭"}
+SHORT最低评分：${r.params.minScoreShort}
+
+RANGE策略：${r.params.enableRange ? "开启" : "关闭"}
+追高/追空过滤：${(r.params.maxChasePct*100).toFixed(2)}%
+交易冷却：${r.params.tradeCooldown} 根K线
+连亏冷却：${r.params.lossCooldown} 根K线
+
+【说明】
+✔ 降噪过滤
+✔ 默认只做TREND_LONG
+✔ SHORT独立开关
+✔ RANGE默认关闭
+✔ 修复手续费双扣
 ✔ 保留标准PnL模型
-✔ 保留分策略统计
 ✔ 保留一键复制报告
+`;
+}
+
+// ==========================
+// 展示多种子报告
+// ==========================
+function displayMultiReport(r){
+    let lines = r.summaries.map(x=>{
+        return `seed ${x.seed} | 收益 ${(x.returnRate*100).toFixed(2)}% | DD ${(x.maxDrawdown*100).toFixed(2)}% | PF ${x.profitFactor.toFixed(2)} | 交易 ${x.tradesCount}`;
+    }).join("\n");
+
+    document.getElementById("out").innerText =
+`【V7.4 多种子稳定性测试报告】
+
+测试次数：${r.runs}
+
+平均收益率：${(r.aggregate.avgReturn*100).toFixed(2)}%
+平均最大回撤：${(r.aggregate.avgDrawdown*100).toFixed(2)}%
+平均Profit Factor：${r.aggregate.avgProfitFactor.toFixed(2)}
+平均交易次数：${r.aggregate.avgTrades.toFixed(2)}
+
+盈利次数：${r.aggregate.positiveRuns} / ${r.runs}
+盈利占比：${(r.aggregate.positiveRate*100).toFixed(2)}%
+
+触发最大回撤次数：${r.aggregate.stoppedByDD} / ${r.runs}
+
+最佳：
+seed ${r.aggregate.best.seed}
+收益率：${(r.aggregate.best.returnRate*100).toFixed(2)}%
+最终资金：${r.aggregate.best.finalCapital.toFixed(2)}
+PF：${r.aggregate.best.profitFactor.toFixed(2)}
+
+最差：
+seed ${r.aggregate.worst.seed}
+收益率：${(r.aggregate.worst.returnRate*100).toFixed(2)}%
+最终资金：${r.aggregate.worst.finalCapital.toFixed(2)}
+PF：${r.aggregate.worst.profitFactor.toFixed(2)}
+
+【逐个种子结果】
+${lines}
+
+【说明】
+✔ 多种子测试用于检查是否过拟合
+✔ 单一seed盈利不代表策略稳定
+✔ 重点看平均PF、盈利占比、触发回撤次数
+✔ 一键复制可发给AI继续分析
 `;
 }
 
