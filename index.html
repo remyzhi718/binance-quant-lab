@@ -2,88 +2,58 @@
 <html lang="zh">
 <head>
 <meta charset="UTF-8">
-<title>量化回测 FINAL（实盘前版本）</title>
+<title>V7 回测一键版</title>
 <style>
 body{background:#0b1220;color:white;font-family:Arial;padding:20px}
 button{padding:12px;width:100%;margin-top:10px}
-.card{background:#162033;padding:15px;border-radius:10px;margin-top:10px}
-pre{white-space:pre-wrap}
+pre{background:#162033;padding:10px;border-radius:10px;white-space:pre-wrap}
 </style>
 </head>
 
 <body>
 
-<h2>🚀 实盘前回测 FINAL版</h2>
+<h2>🚀 V7 一键回测（简化版）</h2>
 
-<div class="card">
 <button onclick="run()">开始回测</button>
-</div>
 
-<div class="card">
-<pre id="out">等待运行...</pre>
-</div>
+<pre id="out">等待...</pre>
 
 <script>
 
-// ===== 生成模拟K线 =====
-function genData(){
-    let data=[];
-    let price=100;
-
-    for(let i=0;i<800;i++){
-        let change=(Math.random()-0.5)*2;
-        price+=change;
-
-        data.push({
-            open:price,
-            close:price+(Math.random()-0.5),
-            high:price+Math.random()*1.2,
-            low:price-Math.random()*1.2,
+// ===== 模拟K线 =====
+function gen(){
+    let d=[],p=100;
+    for(let i=0;i<2000;i++){
+        p += (Math.random()-0.5)*2;
+        d.push({
+            open:p,
+            close:p+(Math.random()-0.5),
+            high:p+Math.random(),
+            low:p-Math.random(),
             vol:Math.random()*100
         });
     }
-    return data;
+    return d;
 }
 
-// ===== EMA =====
-function ema(data,period){
-    let k=2/(period+1);
-    let e=data[0];
+// ===== 信号 =====
+function signal(d,i){
+    if(i<50) return null;
 
-    for(let i=1;i<data.length;i++){
-        e=data[i]*k+e*(1-k);
-    }
-    return e;
-}
+    let s=d.slice(i-20,i);
 
-// ===== 策略信号（无未来函数）=====
-function signal(data,i){
+    let high=Math.max(...s.map(x=>x.high));
+    let volAvg=s.reduce((a,b)=>a+b.vol,0)/s.length;
 
-    if(i<200) return null;
+    let c=d[i];
 
-    let slice=data.slice(i-20,i);
-
-    let closes=slice.map(x=>x.close);
-    let vols=slice.map(x=>x.vol);
-
-    let high20=Math.max(...slice.map(x=>x.high));
-    let avgVol=vols.reduce((a,b)=>a+b)/vols.length;
-
-    let price=data[i].close;
-
-    // ===== 趋势过滤（关键）=====
-    let ema200=ema(closes,20);
-
-    if(price<ema200) return null; // 只做多趋势
-
-    // ===== 防插针 =====
-    let body=Math.abs(data[i].open-price);
-    let wick=data[i].high-Math.max(data[i].open,price);
-
+    // 防插针
+    let body=Math.abs(c.open-c.close);
+    let wick=c.high-Math.max(c.open,c.close);
     if(wick>body*2.5) return null;
 
-    // ===== 突破条件 =====
-    if(price>high20 && data[i].vol>avgVol*1.3){
+    // 趋势突破
+    if(c.close>high && c.vol>volAvg*1.2){
         return "LONG";
     }
 
@@ -93,63 +63,40 @@ function signal(data,i){
 // ===== 回测 =====
 function run(){
 
-let data=genData();
-
+let d=gen();
 let capital=300;
-let position=null;
+let pos=null;
 let trades=[];
-let fee=0.0004;
-let slippage=0.0005;
 
-for(let i=200;i<data.length-1;i++){
+for(let i=50;i<d.length-1;i++){
 
-    let sig=signal(data,i);
-    let next=data[i+1]; // t+1执行（实盘逻辑）
+    let sig=signal(d,i);
+    let next=d[i+1];
 
-    // ===== 持仓管理 =====
-    if(position){
+    if(pos){
 
-        let pnl=(next.close-position.entry)/position.entry;
+        let pnl=(next.close-pos.entry)/pos.entry;
 
-        // 止盈止损
         if(pnl>0.03 || pnl<-0.015){
-
             capital+=capital*pnl;
-            capital-=capital*fee;
-
-            position=null;
+            pos=null;
             trades.push(pnl);
         }
     }
 
-    // ===== 开仓 =====
-    if(sig==="LONG" && !position){
-
-        position={
-            entry: next.close*(1+slippage)
-        };
+    if(sig==="LONG" && !pos){
+        pos={entry:next.close};
     }
 }
 
 let win=trades.filter(x=>x>0).length;
-let lose=trades.filter(x=>x<=0).length;
+let lose=trades.length-win;
 
 document.getElementById("out").innerText=`
-【FINAL 回测结果】
-
 最终资金：${capital.toFixed(2)}
 收益率：${((capital-300)/300*100).toFixed(2)}%
 交易次数：${trades.length}
 胜率：${(win/(win+lose||1)*100).toFixed(2)}%
-
-核心特性：
-✔ 无未来函数
-✔ EMA趋势过滤
-✔ t+1执行
-✔ 手续费 + 滑点
-✔ 防插针机制
-
-状态：可进入实盘优化阶段
 `;
 }
 
