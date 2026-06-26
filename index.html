@@ -2,7 +2,7 @@
 <html lang="zh">
 <head>
 <meta charset="UTF-8">
-<title>V7.4 降噪稳定版量化回测引擎</title>
+<title>V7.5 Binance真实K线回测系统</title>
 <style>
 body{
     background:#0b1220;
@@ -17,7 +17,7 @@ h2{margin-top:0}
     border-radius:10px;
     margin:10px 0;
 }
-button,input{
+button,input,select{
     padding:10px;
     margin:6px 0;
     width:100%;
@@ -35,7 +35,7 @@ pre{
     padding:12px;
     border-radius:10px;
     white-space:pre-wrap;
-    max-height:680px;
+    max-height:720px;
     overflow:auto;
 }
 label{
@@ -51,21 +51,33 @@ label{
 
 <body>
 
-<h2>🚀 V7.4 降噪稳定版量化回测引擎</h2>
+<h2>🚀 V7.5 Binance真实K线回测系统</h2>
 
 <div class="card">
 
+<label>Binance Futures API Base</label>
+<input id="apiBase" value="https://fapi.binance.com">
+
+<label>单币种回测交易对</label>
+<input id="symbol" value="BTCUSDT">
+
+<label>多币种测试，英文逗号分隔</label>
+<input id="symbols" value="BTCUSDT,ETHUSDT,SOLUSDT">
+
+<label>K线周期</label>
+<select id="interval">
+    <option value="5m">5m</option>
+    <option value="15m" selected>15m</option>
+    <option value="30m">30m</option>
+    <option value="1h">1h</option>
+    <option value="4h">4h</option>
+</select>
+
+<label>拉取K线数量，建议 1500 / 3000 / 6000</label>
+<input id="bars" value="3000">
+
 <label>初始资金 USDT</label>
 <input id="initialCapital" value="300">
-
-<label>K线数量</label>
-<input id="bars" value="20000">
-
-<label>随机种子，单次回测用</label>
-<input id="seed" value="42">
-
-<label>多种子测试数量</label>
-<input id="multiCount" value="20">
 
 <label>单笔风险 %</label>
 <input id="riskPct" value="1">
@@ -79,7 +91,7 @@ label{
 <label>最大名义仓位倍数，1 = 不超过本金</label>
 <input id="maxExposure" value="1">
 
-<label>最大回撤熔断 %，建议 15~20</label>
+<label>最大回撤熔断 %</label>
 <input id="maxDDLimit" value="15">
 
 <label>手续费单边 %</label>
@@ -91,19 +103,19 @@ label{
 <label>是否开启 TREND_LONG，1=开启，0=关闭</label>
 <input id="enableLong" value="1">
 
-<label>TREND_LONG 最低评分，建议 6</label>
+<label>TREND_LONG 最低评分</label>
 <input id="minScoreLong" value="6">
 
 <label>是否开启 TREND_SHORT，1=开启，0=关闭</label>
 <input id="enableShort" value="0">
 
-<label>TREND_SHORT 最低评分，建议 7</label>
+<label>TREND_SHORT 最低评分</label>
 <input id="minScoreShort" value="7">
 
-<label>是否开启 RANGE 震荡策略，0=关闭，1=开启</label>
+<label>是否开启 RANGE 策略，0=关闭，1=开启</label>
 <input id="enableRange" value="0">
 
-<label>追高/追空过滤 %，价格距离EMA20过远不追</label>
+<label>追高/追空过滤 %，价格距离 EMA20 过远不追</label>
 <input id="maxChasePct" value="2.5">
 
 <label>每笔交易结束后的冷却K线数</label>
@@ -115,12 +127,12 @@ label{
 <label>连续亏损后的冷却K线数</label>
 <input id="lossCooldown" value="60">
 
-<button onclick="runSingle()">开始单次回测</button>
-<button onclick="runMultiSeed()">开始多种子测试</button>
+<button onclick="runSingleReal()">开始真实K线单币种回测</button>
+<button onclick="runMultiReal()">开始真实K线多币种测试</button>
 <button onclick="copyReport()">📋 一键复制报告</button>
 
 <div class="small">
-V7.4 默认只做 TREND_LONG，关闭 SHORT 和 RANGE，用来降低噪音、减少手续费、提升稳定性。
+V7.5 只做历史K线回测，不下单，不需要 API Key。若出现 Failed to fetch，多半是网络、地区或浏览器跨域限制。
 </div>
 
 </div>
@@ -139,6 +151,10 @@ function num(id){
     return Number(document.getElementById(id).value);
 }
 
+function text(id){
+    return document.getElementById(id).value.trim();
+}
+
 function avg(arr){
     if(!arr.length) return 0;
     return arr.reduce((a,b)=>a+b,0) / arr.length;
@@ -152,80 +168,142 @@ function min(arr){
     return Math.min(...arr);
 }
 
+function sleep(ms){
+    return new Promise(resolve=>setTimeout(resolve, ms));
+}
+
+function fmtTime(ts){
+    let d = new Date(ts);
+    return d.toISOString().replace("T"," ").slice(0,16);
+}
+
+function setOut(s){
+    document.getElementById("out").innerText = s;
+}
+
 // ==========================
-// 可复现随机数
+// 读取参数
 // ==========================
-function mulberry32(seed){
-    return function(){
-        let t = seed += 0x6D2B79F5;
-        t = Math.imul(t ^ t >>> 15, t | 1);
-        t ^= t + Math.imul(t ^ t >>> 7, t | 61);
-        return ((t ^ t >>> 14) >>> 0) / 4294967296;
+function readParams(){
+    return {
+        apiBase:text("apiBase").replace(/\/$/,""),
+        symbol:text("symbol").toUpperCase(),
+        symbols:text("symbols").split(",").map(x=>x.trim().toUpperCase()).filter(Boolean),
+        interval:text("interval"),
+        bars:num("bars"),
+
+        initialCapital:num("initialCapital"),
+
+        riskPct:num("riskPct") / 100,
+        stopLossPct:num("stopLoss") / 100,
+        takeProfitPct:num("takeProfit") / 100,
+        maxExposure:num("maxExposure"),
+        maxDDLimit:num("maxDDLimit") / 100,
+        feePct:num("feePct") / 100,
+        slippagePct:num("slippagePct") / 100,
+
+        enableLong:num("enableLong") === 1,
+        minScoreLong:num("minScoreLong"),
+
+        enableShort:num("enableShort") === 1,
+        minScoreShort:num("minScoreShort"),
+
+        enableRange:num("enableRange") === 1,
+
+        maxChasePct:num("maxChasePct") / 100,
+
+        tradeCooldown:num("tradeCooldown"),
+        lossStreakLimit:num("lossStreakLimit"),
+        lossCooldown:num("lossCooldown"),
+
+        maxBarsHeld:100
     };
 }
 
 // ==========================
-// 模拟K线生成
-// 趋势 / 震荡 / 高波动
+// Binance 真实K线拉取
+// USD-M Futures: /fapi/v1/klines
+// 每次最多1500根，向前分页
 // ==========================
-function genData(n, seed){
-    let rnd = mulberry32(seed);
-    let d = [];
-    let price = 100;
+async function fetchRealKlines(params, symbol){
+    let all = [];
+    let endTime = null;
+    let target = params.bars;
+    let batchLimit = 1500;
 
-    for(let i=0;i<n;i++){
+    while(all.length < target){
+        let limit = Math.min(batchLimit, target - all.length);
 
-        let cycle = i % 5000;
-        let drift = 0;
-        let volBoost = 1;
+        let url = `${params.apiBase}/fapi/v1/klines?symbol=${symbol}&interval=${params.interval}&limit=${limit}`;
 
-        // 上涨趋势段
-        if(cycle >= 500 && cycle < 1700){
-            drift = 0.00045;
-            volBoost = 1.15;
+        if(endTime){
+            url += `&endTime=${endTime}`;
         }
 
-        // 震荡段
-        if(cycle >= 1700 && cycle < 3000){
-            drift = 0;
-            volBoost = 0.75;
+        setOut(`正在拉取真实K线...\n交易对：${symbol}\n周期：${params.interval}\n已获取：${all.length}/${target}`);
+
+        let res;
+
+        try{
+            res = await fetch(url);
+        }catch(e){
+            throw new Error("网络请求失败。可能是 Binance 访问受限、浏览器跨域、网络问题。错误：" + e.message);
         }
 
-        // 下跌趋势段
-        if(cycle >= 3000 && cycle < 4200){
-            drift = -0.00045;
-            volBoost = 1.15;
+        if(!res.ok){
+            let body = await res.text();
+            throw new Error(`Binance接口错误：HTTP ${res.status}\n${body}`);
         }
 
-        // 高波动段
-        if(cycle >= 4200){
-            drift = 0;
-            volBoost = 2.6;
+        let data = await res.json();
+
+        if(!Array.isArray(data) || data.length === 0){
+            break;
         }
 
-        let noise = (rnd() - 0.5) * 0.012 * volBoost;
-        let ret = drift + noise;
+        all = data.concat(all);
 
-        let open = price;
-        let close = Math.max(1, open * (1 + ret));
+        let firstOpenTime = data[0][0];
+        endTime = firstOpenTime - 1;
 
-        let wick = rnd() * 0.006 * volBoost;
-        let high = Math.max(open, close) * (1 + wick);
-        let low = Math.min(open, close) * (1 - wick);
-        let volume = 100 + rnd() * 180 * volBoost;
+        if(data.length < limit){
+            break;
+        }
 
-        price = close;
-
-        d.push({
-            open,
-            high,
-            low,
-            close,
-            vol: volume
-        });
+        await sleep(180);
     }
 
-    return d;
+    // 去重 + 排序
+    let map = new Map();
+
+    for(let k of all){
+        map.set(k[0], k);
+    }
+
+    let unique = Array.from(map.values()).sort((a,b)=>a[0]-b[0]);
+
+    // 删除未收盘K线
+    let now = Date.now();
+    unique = unique.filter(k => k[6] < now);
+
+    // 只保留最后 target 根
+    unique = unique.slice(-target);
+
+    let bars = unique.map(k=>({
+        openTime:Number(k[0]),
+        open:Number(k[1]),
+        high:Number(k[2]),
+        low:Number(k[3]),
+        close:Number(k[4]),
+        vol:Number(k[5]),
+        closeTime:Number(k[6])
+    }));
+
+    if(bars.length < 200){
+        throw new Error(`K线数量太少：${bars.length}，无法回测`);
+    }
+
+    return bars;
 }
 
 // ==========================
@@ -356,7 +434,7 @@ function riskFilter(d, i){
         return false;
     }
 
-    // 防单根极端波动
+    // 防极端单根波动
     let rangePct = (c.high - c.low) / c.close;
 
     if(rangePct > 0.035){
@@ -367,7 +445,7 @@ function riskFilter(d, i){
 }
 
 // ==========================
-// 评分系统：TREND_LONG
+// TREND_LONG 评分
 // ==========================
 function scoreTrendLong(d, i, ms){
     let s20 = d.slice(i-20, i);
@@ -416,14 +494,11 @@ function scoreTrendLong(d, i, ms){
         reasons.push("ATR正常");
     }
 
-    return {
-        score,
-        reasons
-    };
+    return {score, reasons};
 }
 
 // ==========================
-// 评分系统：TREND_SHORT
+// TREND_SHORT 评分
 // ==========================
 function scoreTrendShort(d, i, ms){
     let s20 = d.slice(i-20, i);
@@ -472,14 +547,11 @@ function scoreTrendShort(d, i, ms){
         reasons.push("ATR正常");
     }
 
-    return {
-        score,
-        reasons
-    };
+    return {score, reasons};
 }
 
 // ==========================
-// RANGE策略，默认关闭
+// RANGE 策略，默认关闭
 // ==========================
 function rangeSignal(d, i){
     let s20 = d.slice(i-20, i);
@@ -509,7 +581,7 @@ function rangeSignal(d, i){
 }
 
 // ==========================
-// 总信号函数
+// 信号函数
 // 信号在第 i 根K线收盘确认
 // 下一根K线开盘执行
 // ==========================
@@ -526,10 +598,8 @@ function signal(d, i, params){
 
     let price = d[i].close;
 
-    // TREND_LONG
     if(params.enableLong && ms.state === "TREND_UP"){
         let longScore = scoreTrendLong(d, i, ms);
-
         let chasePct = (price - ms.ema20) / price;
 
         if(
@@ -548,10 +618,8 @@ function signal(d, i, params){
         }
     }
 
-    // TREND_SHORT
     if(params.enableShort && ms.state === "TREND_DOWN"){
         let shortScore = scoreTrendShort(d, i, ms);
-
         let chasePct = (ms.ema20 - price) / price;
 
         if(
@@ -570,7 +638,6 @@ function signal(d, i, params){
         }
     }
 
-    // RANGE
     if(params.enableRange){
         let r = rangeSignal(d, i);
 
@@ -599,7 +666,7 @@ function calcNotional(capital, riskPct, stopLossPct, maxExposure){
 // ==========================
 // 开仓
 // ==========================
-function openPosition(sig, rawPrice, capital, params){
+function openPosition(sig, rawPrice, capital, params, entryIndex){
     let notional = calcNotional(
         capital,
         params.riskPct,
@@ -628,7 +695,8 @@ function openPosition(sig, rawPrice, capital, params){
         entry,
         notional,
         openFee,
-        barsHeld:0
+        barsHeld:0,
+        entryIndex
     };
 }
 
@@ -648,6 +716,7 @@ function checkExit(pos, bar, params){
         let stop = pos.entry * (1 - sl);
         let take = pos.entry * (1 + tp);
 
+        // 同一根K线同时触发，保守按止损
         if(bar.low <= stop){
             exitPrice = stop * (1 - params.slippagePct);
             reason = "STOP";
@@ -677,14 +746,11 @@ function checkExit(pos, bar, params){
 
     if(!exitPrice) return null;
 
-    return {
-        exitPrice,
-        reason
-    };
+    return {exitPrice, reason};
 }
 
 // ==========================
-// 强制最终平仓
+// 最终强制平仓
 // ==========================
 function finalExitPrice(pos, rawPrice, params){
     if(pos.direction === "LONG"){
@@ -695,7 +761,7 @@ function finalExitPrice(pos, rawPrice, params){
 }
 
 // ==========================
-// 平仓PnL计算
+// 平仓PnL
 // 手续费只在这里统一扣一次
 // ==========================
 function closePosition(pos, exitPrice, capital, params){
@@ -782,46 +848,9 @@ function calcStrategyStats(trades){
 }
 
 // ==========================
-// 参数读取
+// 回测核心
 // ==========================
-function readParams(){
-    return {
-        initialCapital:num("initialCapital"),
-        bars:num("bars"),
-        seed:num("seed"),
-
-        riskPct:num("riskPct") / 100,
-        stopLossPct:num("stopLoss") / 100,
-        takeProfitPct:num("takeProfit") / 100,
-        maxExposure:num("maxExposure"),
-        maxDDLimit:num("maxDDLimit") / 100,
-        feePct:num("feePct") / 100,
-        slippagePct:num("slippagePct") / 100,
-
-        enableLong:num("enableLong") === 1,
-        minScoreLong:num("minScoreLong"),
-
-        enableShort:num("enableShort") === 1,
-        minScoreShort:num("minScoreShort"),
-
-        enableRange:num("enableRange") === 1,
-
-        maxChasePct:num("maxChasePct") / 100,
-
-        tradeCooldown:num("tradeCooldown"),
-        lossStreakLimit:num("lossStreakLimit"),
-        lossCooldown:num("lossCooldown"),
-
-        maxBarsHeld:100
-    };
-}
-
-// ==========================
-// 单次回测核心
-// ==========================
-function backtestOnce(params){
-    let d = genData(params.bars, params.seed);
-
+function backtestRealData(d, params, symbol){
     let capital = params.initialCapital;
     let peak = params.initialCapital;
     let maxDD = 0;
@@ -837,6 +866,14 @@ function backtestOnce(params){
     let skipped = {
         cooldown:0,
         noSignal:0
+    };
+
+    let stateCounts = {
+        UNKNOWN:0,
+        VOLATILE:0,
+        TREND_UP:0,
+        TREND_DOWN:0,
+        RANGE:0
     };
 
     function updateDrawdown(){
@@ -855,6 +892,9 @@ function backtestOnce(params){
 
     for(let i=170;i<d.length-1;i++){
 
+        let ms = marketState(d, i);
+        stateCounts[ms.state] = (stateCounts[ms.state] || 0) + 1;
+
         if(capital <= 0){
             capital = 0;
             stoppedReason = "资金归零";
@@ -868,11 +908,9 @@ function backtestOnce(params){
             break;
         }
 
-        let nextBar = d[i+1];
-
-        // 先管理持仓
-        if(position){
-            let exit = checkExit(position, nextBar, params);
+        // 先管理持仓，用当前K线检查止盈止损
+        if(position && i >= position.entryIndex){
+            let exit = checkExit(position, d[i], params);
 
             if(exit){
                 let result = closePosition(position, exit.exitPrice, capital, params);
@@ -880,7 +918,8 @@ function backtestOnce(params){
 
                 result.trade.reason = exit.reason;
                 result.trade.capitalAfter = capital;
-                result.trade.seed = params.seed;
+                result.trade.symbol = symbol;
+                result.trade.exitTime = d[i].closeTime;
 
                 trades.push(result.trade);
 
@@ -914,19 +953,31 @@ function backtestOnce(params){
             continue;
         }
 
-        // 无持仓才允许开仓
+        // 无持仓才开仓
         if(!position){
             let sig = signal(d, i, params);
 
             if(sig){
-                position = openPosition(sig, nextBar.open, capital, params);
+                let entryBar = d[i+1];
+
+                position = openPosition(
+                    sig,
+                    entryBar.open,
+                    capital,
+                    params,
+                    i+1
+                );
+
+                if(position){
+                    position.entryTime = entryBar.openTime;
+                }
             }else{
                 skipped.noSignal++;
             }
         }
     }
 
-    // 最后一根K线强制平仓，避免未实现盈亏遗漏
+    // 最后一根强制平仓
     if(position && capital > 0){
         let lastBar = d[d.length-1];
         let exitPrice = finalExitPrice(position, lastBar.close, params);
@@ -936,7 +987,8 @@ function backtestOnce(params){
 
         result.trade.reason = "FINAL_EXIT";
         result.trade.capitalAfter = capital;
-        result.trade.seed = params.seed;
+        result.trade.symbol = symbol;
+        result.trade.exitTime = lastBar.closeTime;
 
         trades.push(result.trade);
 
@@ -959,9 +1011,13 @@ function backtestOnce(params){
     let strategyStats = calcStrategyStats(trades);
 
     return {
-        version:"V7.4 降噪稳定版",
+        version:"V7.5 Binance真实K线回测",
+        symbol,
+        interval:params.interval,
+        dataBars:d.length,
+        dataStart:fmtTime(d[0].openTime),
+        dataEnd:fmtTime(d[d.length-1].closeTime),
         stoppedReason,
-        seed:params.seed,
         initialCapital:params.initialCapital,
         finalCapital:capital,
         returnRate:(capital - params.initialCapital) / params.initialCapital,
@@ -973,94 +1029,129 @@ function backtestOnce(params){
         avgLoss,
         totalFees,
         strategyStats,
+        stateCounts,
         skipped,
-        params,
+        params:{
+            riskPct:params.riskPct,
+            stopLossPct:params.stopLossPct,
+            takeProfitPct:params.takeProfitPct,
+            maxExposure:params.maxExposure,
+            maxDDLimit:params.maxDDLimit,
+            feePct:params.feePct,
+            slippagePct:params.slippagePct,
+            enableLong:params.enableLong,
+            minScoreLong:params.minScoreLong,
+            enableShort:params.enableShort,
+            minScoreShort:params.minScoreShort,
+            enableRange:params.enableRange,
+            maxChasePct:params.maxChasePct,
+            tradeCooldown:params.tradeCooldown,
+            lossStreakLimit:params.lossStreakLimit,
+            lossCooldown:params.lossCooldown
+        },
         lastTrades:trades.slice(-50)
     };
 }
 
 // ==========================
-// 单次回测按钮
+// 单币种真实回测
 // ==========================
-function runSingle(){
+async function runSingleReal(){
     let params = readParams();
 
-    let report = backtestOnce(params);
+    try{
+        setOut("准备拉取真实K线...");
+        let d = await fetchRealKlines(params, params.symbol);
+        let report = backtestRealData(d, params, params.symbol);
 
-    lastReport = report;
+        lastReport = report;
 
-    displaySingleReport(report);
+        displaySingleReport(report);
+    }catch(e){
+        setOut("❌ 回测失败：\n\n" + e.message);
+    }
 }
 
 // ==========================
-// 多种子测试按钮
+// 多币种真实测试
 // ==========================
-function runMultiSeed(){
-    let base = readParams();
-    let count = num("multiCount");
-
+async function runMultiReal(){
+    let params = readParams();
     let reports = [];
 
-    for(let i=0;i<count;i++){
-        let p = {
-            ...base,
-            seed:base.seed + i
+    try{
+        for(let i=0;i<params.symbols.length;i++){
+            let sym = params.symbols[i];
+
+            setOut(`正在测试多币种...\n进度：${i+1}/${params.symbols.length}\n当前：${sym}`);
+
+            let d = await fetchRealKlines(params, sym);
+            let r = backtestRealData(d, params, sym);
+
+            reports.push(r);
+
+            await sleep(300);
+        }
+
+        let validPF = reports.map(r=>r.profitFactor >= 999 ? 10 : r.profitFactor);
+
+        let avgReturn = avg(reports.map(r=>r.returnRate));
+        let avgDD = avg(reports.map(r=>r.maxDrawdown));
+        let avgPF = avg(validPF);
+        let avgTrades = avg(reports.map(r=>r.tradesCount));
+        let positive = reports.filter(r=>r.returnRate > 0).length;
+        let ddStop = reports.filter(r=>r.stoppedReason.includes("最大回撤")).length;
+
+        let best = reports.reduce((a,b)=>a.returnRate > b.returnRate ? a : b);
+        let worst = reports.reduce((a,b)=>a.returnRate < b.returnRate ? a : b);
+
+        lastReport = {
+            version:"V7.5 Binance真实K线多币种测试",
+            interval:params.interval,
+            bars:params.bars,
+            symbols:params.symbols,
+            aggregate:{
+                avgReturn,
+                avgDrawdown:avgDD,
+                avgProfitFactor:avgPF,
+                avgTrades,
+                positiveRuns:positive,
+                positiveRate:positive / reports.length,
+                stoppedByDD:ddStop,
+                best:{
+                    symbol:best.symbol,
+                    returnRate:best.returnRate,
+                    finalCapital:best.finalCapital,
+                    profitFactor:best.profitFactor
+                },
+                worst:{
+                    symbol:worst.symbol,
+                    returnRate:worst.returnRate,
+                    finalCapital:worst.finalCapital,
+                    profitFactor:worst.profitFactor
+                }
+            },
+            reports:reports.map(r=>({
+                symbol:r.symbol,
+                interval:r.interval,
+                dataStart:r.dataStart,
+                dataEnd:r.dataEnd,
+                finalCapital:r.finalCapital,
+                returnRate:r.returnRate,
+                maxDrawdown:r.maxDrawdown,
+                tradesCount:r.tradesCount,
+                winRate:r.winRate,
+                profitFactor:r.profitFactor,
+                totalFees:r.totalFees,
+                stoppedReason:r.stoppedReason,
+                strategyStats:r.strategyStats
+            }))
         };
 
-        reports.push(backtestOnce(p));
+        displayMultiReport(lastReport);
+    }catch(e){
+        setOut("❌ 多币种测试失败：\n\n" + e.message);
     }
-
-    let avgReturn = avg(reports.map(r=>r.returnRate));
-    let avgDD = avg(reports.map(r=>r.maxDrawdown));
-    let avgPF = avg(reports.map(r=>r.profitFactor >= 999 ? 10 : r.profitFactor));
-    let avgTrades = avg(reports.map(r=>r.tradesCount));
-
-    let positiveRuns = reports.filter(r=>r.returnRate > 0).length;
-    let stoppedByDD = reports.filter(r=>r.stoppedReason.includes("最大回撤")).length;
-
-    let best = reports.reduce((a,b)=>a.returnRate > b.returnRate ? a : b);
-    let worst = reports.reduce((a,b)=>a.returnRate < b.returnRate ? a : b);
-
-    let summaries = reports.map(r=>({
-        seed:r.seed,
-        finalCapital:r.finalCapital,
-        returnRate:r.returnRate,
-        maxDrawdown:r.maxDrawdown,
-        tradesCount:r.tradesCount,
-        winRate:r.winRate,
-        profitFactor:r.profitFactor,
-        stoppedReason:r.stoppedReason
-    }));
-
-    lastReport = {
-        version:"V7.4 降噪稳定版_多种子测试",
-        runs:count,
-        aggregate:{
-            avgReturn,
-            avgDrawdown:avgDD,
-            avgProfitFactor:avgPF,
-            avgTrades,
-            positiveRuns,
-            positiveRate:positiveRuns / count,
-            stoppedByDD,
-            best:{
-                seed:best.seed,
-                returnRate:best.returnRate,
-                finalCapital:best.finalCapital,
-                profitFactor:best.profitFactor
-            },
-            worst:{
-                seed:worst.seed,
-                returnRate:worst.returnRate,
-                finalCapital:worst.finalCapital,
-                profitFactor:worst.profitFactor
-            }
-        },
-        params:base,
-        summaries
-    };
-
-    displayMultiReport(lastReport);
 }
 
 // ==========================
@@ -1088,11 +1179,15 @@ ${k}：
     }
 
     document.getElementById("out").innerText =
-`【V7.4 降噪稳定版单次回测报告】
+`【V7.5 Binance真实K线单币种回测报告】
+
+交易对：${r.symbol}
+周期：${r.interval}
+K线数量：${r.dataBars}
+数据区间：${r.dataStart} → ${r.dataEnd}
 
 停止原因：${r.stoppedReason}
 
-随机种子：${r.seed}
 初始资金：${r.initialCapital.toFixed(2)}
 最终资金：${r.finalCapital.toFixed(2)}
 收益率：${(r.returnRate*100).toFixed(2)}%
@@ -1107,6 +1202,13 @@ Profit Factor：${r.profitFactor.toFixed(2)}
 
 【分策略统计】
 ${strategyText}
+
+【市场状态统计】
+UNKNOWN：${r.stateCounts.UNKNOWN || 0}
+VOLATILE：${r.stateCounts.VOLATILE || 0}
+TREND_UP：${r.stateCounts.TREND_UP || 0}
+TREND_DOWN：${r.stateCounts.TREND_DOWN || 0}
+RANGE：${r.stateCounts.RANGE || 0}
 
 【参数】
 单笔风险：${(r.params.riskPct*100).toFixed(2)}%
@@ -1129,59 +1231,60 @@ RANGE策略：${r.params.enableRange ? "开启" : "关闭"}
 连亏冷却：${r.params.lossCooldown} 根K线
 
 【说明】
-✔ 降噪过滤
-✔ 默认只做TREND_LONG
-✔ SHORT独立开关
-✔ RANGE默认关闭
-✔ 修复手续费双扣
-✔ 保留标准PnL模型
-✔ 保留一键复制报告
+✔ 使用 Binance 真实历史K线
+✔ 不使用未来函数
+✔ 信号收盘确认，下一根开盘执行
+✔ 标准PnL模型
+✔ 手续费/滑点
+✔ 最大回撤熔断
+✔ 一键复制报告
 `;
 }
 
 // ==========================
-// 展示多种子报告
+// 展示多币种报告
 // ==========================
 function displayMultiReport(r){
-    let lines = r.summaries.map(x=>{
-        return `seed ${x.seed} | 收益 ${(x.returnRate*100).toFixed(2)}% | DD ${(x.maxDrawdown*100).toFixed(2)}% | PF ${x.profitFactor.toFixed(2)} | 交易 ${x.tradesCount}`;
+    let lines = r.reports.map(x=>{
+        return `${x.symbol} | 收益 ${(x.returnRate*100).toFixed(2)}% | DD ${(x.maxDrawdown*100).toFixed(2)}% | PF ${x.profitFactor.toFixed(2)} | 交易 ${x.tradesCount} | ${x.stoppedReason}`;
     }).join("\n");
 
     document.getElementById("out").innerText =
-`【V7.4 多种子稳定性测试报告】
+`【V7.5 Binance真实K线多币种测试报告】
 
-测试次数：${r.runs}
+周期：${r.interval}
+K线数量：${r.bars}
+交易对：${r.symbols.join(", ")}
 
 平均收益率：${(r.aggregate.avgReturn*100).toFixed(2)}%
 平均最大回撤：${(r.aggregate.avgDrawdown*100).toFixed(2)}%
-平均Profit Factor：${r.aggregate.avgProfitFactor.toFixed(2)}
+平均 Profit Factor：${r.aggregate.avgProfitFactor.toFixed(2)}
 平均交易次数：${r.aggregate.avgTrades.toFixed(2)}
 
-盈利次数：${r.aggregate.positiveRuns} / ${r.runs}
+盈利数量：${r.aggregate.positiveRuns} / ${r.reports.length}
 盈利占比：${(r.aggregate.positiveRate*100).toFixed(2)}%
 
-触发最大回撤次数：${r.aggregate.stoppedByDD} / ${r.runs}
+触发最大回撤数量：${r.aggregate.stoppedByDD} / ${r.reports.length}
 
 最佳：
-seed ${r.aggregate.best.seed}
+${r.aggregate.best.symbol}
 收益率：${(r.aggregate.best.returnRate*100).toFixed(2)}%
 最终资金：${r.aggregate.best.finalCapital.toFixed(2)}
 PF：${r.aggregate.best.profitFactor.toFixed(2)}
 
 最差：
-seed ${r.aggregate.worst.seed}
+${r.aggregate.worst.symbol}
 收益率：${(r.aggregate.worst.returnRate*100).toFixed(2)}%
 最终资金：${r.aggregate.worst.finalCapital.toFixed(2)}
 PF：${r.aggregate.worst.profitFactor.toFixed(2)}
 
-【逐个种子结果】
+【逐个交易对】
 ${lines}
 
-【说明】
-✔ 多种子测试用于检查是否过拟合
-✔ 单一seed盈利不代表策略稳定
-✔ 重点看平均PF、盈利占比、触发回撤次数
-✔ 一键复制可发给AI继续分析
+【判断】
+真实K线比模拟更重要。
+如果多币种平均 PF > 1.10、盈利占比 ≥ 60%、平均回撤 < 15%，才继续优化。
+如果真实K线明显变差，说明模拟策略过拟合，不能实盘。
 `;
 }
 
