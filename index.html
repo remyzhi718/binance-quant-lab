@@ -2,7 +2,7 @@
 <html lang="zh">
 <head>
 <meta charset="UTF-8">
-<title>V7.3 强趋势过滤量化回测引擎</title>
+<title>V7.3.1 强趋势过滤量化回测引擎</title>
 <style>
 body{
     background:#0b1220;
@@ -35,7 +35,7 @@ pre{
     padding:12px;
     border-radius:10px;
     white-space:pre-wrap;
-    max-height:620px;
+    max-height:650px;
     overflow:auto;
 }
 label{
@@ -51,7 +51,7 @@ label{
 
 <body>
 
-<h2>🚀 V7.3 强趋势过滤量化回测引擎</h2>
+<h2>🚀 V7.3.1 强趋势过滤回测引擎</h2>
 
 <div class="card">
 <label>初始资金 USDT</label>
@@ -59,6 +59,9 @@ label{
 
 <label>K线数量</label>
 <input id="bars" value="20000">
+
+<label>随机种子，相同种子结果可复现</label>
+<input id="seed" value="42">
 
 <label>单笔风险 %</label>
 <input id="riskPct" value="1">
@@ -81,7 +84,7 @@ label{
 <label>滑点 %</label>
 <input id="slippagePct" value="0.05">
 
-<label>最低信号评分，建议 4 或 5</label>
+<label>最低信号评分，建议 5</label>
 <input id="minScore" value="5">
 
 <label>是否开启 RANGE 震荡策略，0=关闭，1=开启</label>
@@ -91,7 +94,7 @@ label{
 <button onclick="copyReport()">📋 一键复制报告</button>
 
 <div class="small">
-建议先用默认参数跑。V7.3 默认关闭震荡交易，只保留强趋势信号。
+V7.3.1 已修复手续费双扣：开仓时不再提前扣 openFee，统一在平仓时扣 openFee + closeFee。
 </div>
 </div>
 
@@ -122,14 +125,23 @@ function min(arr){
     return Math.min(...arr);
 }
 
-function clamp(v, lo, hi){
-    return Math.max(lo, Math.min(hi, v));
+// ==========================
+// 可复现随机数
+// ==========================
+function mulberry32(seed){
+    return function(){
+        let t = seed += 0x6D2B79F5;
+        t = Math.imul(t ^ t >>> 15, t | 1);
+        t ^= t + Math.imul(t ^ t >>> 7, t | 61);
+        return ((t ^ t >>> 14) >>> 0) / 4294967296;
+    };
 }
 
 // ==========================
 // 模拟K线生成：趋势 / 震荡 / 高波动
 // ==========================
-function genData(n){
+function genData(n, seed){
+    let rnd = mulberry32(seed);
     let d = [];
     let price = 100;
 
@@ -139,40 +151,36 @@ function genData(n){
         let drift = 0;
         let volBoost = 1;
 
-        // 上升趋势段
         if(cycle >= 500 && cycle < 1700){
             drift = 0.00045;
             volBoost = 1.15;
         }
 
-        // 震荡段
         if(cycle >= 1700 && cycle < 3000){
             drift = 0;
             volBoost = 0.75;
         }
 
-        // 下降趋势段
         if(cycle >= 3000 && cycle < 4200){
             drift = -0.00045;
             volBoost = 1.15;
         }
 
-        // 高波动段
         if(cycle >= 4200){
             drift = 0;
             volBoost = 2.6;
         }
 
-        let noise = (Math.random() - 0.5) * 0.012 * volBoost;
+        let noise = (rnd() - 0.5) * 0.012 * volBoost;
         let ret = drift + noise;
 
         let open = price;
         let close = Math.max(1, open * (1 + ret));
 
-        let wick = Math.random() * 0.006 * volBoost;
+        let wick = rnd() * 0.006 * volBoost;
         let high = Math.max(open, close) * (1 + wick);
         let low = Math.min(open, close) * (1 - wick);
-        let volume = 100 + Math.random() * 180 * volBoost;
+        let volume = 100 + rnd() * 180 * volBoost;
 
         price = close;
 
@@ -577,7 +585,6 @@ function checkExit(pos, bar, params){
         let stop = pos.entry * (1 - sl);
         let take = pos.entry * (1 + tp);
 
-        // 同一根K线同时碰止损/止盈，保守按止损
         if(bar.low <= stop){
             exitPrice = stop * (1 - params.slippagePct);
             reason = "STOP";
@@ -600,7 +607,6 @@ function checkExit(pos, bar, params){
         }
     }
 
-    // 最长持仓，避免一直卡仓位
     if(!exitPrice && pos.barsHeld >= params.maxBarsHeld){
         exitPrice = bar.close;
         reason = "TIME_EXIT";
@@ -616,6 +622,8 @@ function checkExit(pos, bar, params){
 
 // ==========================
 // 平仓标准PnL计算
+// 手续费修复点：
+// openFee 只在这里扣一次，不在开仓时提前扣。
 // ==========================
 function closePosition(pos, exitPrice, capital, params){
     let directionNum = pos.direction === "LONG" ? 1 : -1;
@@ -623,7 +631,9 @@ function closePosition(pos, exitPrice, capital, params){
     let pnlPct = directionNum * (exitPrice - pos.entry) / pos.entry;
     let grossPnl = pos.notional * pnlPct;
     let closeFee = pos.notional * params.feePct;
-    let netPnl = grossPnl - pos.openFee - closeFee;
+
+    let totalFee = pos.openFee + closeFee;
+    let netPnl = grossPnl - totalFee;
 
     let capitalBefore = capital;
     let capitalAfter = capital + netPnl;
@@ -643,6 +653,7 @@ function closePosition(pos, exitPrice, capital, params){
             grossPnl,
             openFee:pos.openFee,
             closeFee,
+            totalFee,
             netPnl,
             returnOnCapital:netPnl / capitalBefore,
             barsHeld:pos.barsHeld
@@ -702,6 +713,7 @@ function run(){
 
     let params = {
         bars:num("bars"),
+        seed:num("seed"),
         riskPct:num("riskPct") / 100,
         stopLossPct:num("stopLoss") / 100,
         takeProfitPct:num("takeProfit") / 100,
@@ -714,7 +726,7 @@ function run(){
         maxBarsHeld:100
     };
 
-    let d = genData(params.bars);
+    let d = genData(params.bars, params.seed);
 
     let capital = initialCapital;
     let peak = initialCapital;
@@ -730,18 +742,10 @@ function run(){
 
     let skipped = {
         cooldown:0,
-        volatileOrUnknown:0,
         noSignal:0
     };
 
-    for(let i=170;i<d.length-1;i++){
-
-        if(capital <= 0){
-            capital = 0;
-            stoppedReason = "资金归零";
-            break;
-        }
-
+    function updateDrawdown(){
         if(capital > peak){
             peak = capital;
         }
@@ -751,6 +755,19 @@ function run(){
         if(dd > maxDD){
             maxDD = dd;
         }
+
+        return dd;
+    }
+
+    for(let i=170;i<d.length-1;i++){
+
+        if(capital <= 0){
+            capital = 0;
+            stoppedReason = "资金归零";
+            break;
+        }
+
+        let dd = updateDrawdown();
 
         if(dd >= params.maxDDLimit){
             stoppedReason = "最大回撤超过限制，停止交易";
@@ -778,13 +795,19 @@ function run(){
                     consecutiveLoss = 0;
                 }
 
-                // 连亏冷却
                 if(consecutiveLoss >= 3){
                     cooldown = 40;
                     consecutiveLoss = 0;
                 }
 
                 position = null;
+
+                dd = updateDrawdown();
+
+                if(dd >= params.maxDDLimit){
+                    stoppedReason = "最大回撤超过限制，停止交易";
+                    break;
+                }
             }
         }
 
@@ -801,10 +824,9 @@ function run(){
             if(sig){
                 position = openPosition(sig, nextBar.open, capital, params);
 
-                if(position){
-                    // 开仓手续费立即扣除
-                    capital -= position.openFee;
-                }
+                // 关键修复：
+                // 这里不再执行 capital -= position.openFee;
+                // 开仓手续费统一在平仓时和closeFee一起扣除。
             }else{
                 skipped.noSignal++;
             }
@@ -823,10 +845,13 @@ function run(){
     let avgWin = wins.length ? grossProfit / wins.length : 0;
     let avgLoss = losses.length ? grossLoss / losses.length : 0;
 
+    let totalFees = trades.reduce((a,b)=>a+b.totalFee,0);
+
     let strategyStats = calcStrategyStats(trades);
 
     lastReport = {
-        version:"V7.3 强趋势过滤量化回测引擎",
+        version:"V7.3.1 强趋势过滤量化回测引擎_手续费修复版",
+        feeBugFixed:true,
         stoppedReason,
         initialCapital,
         finalCapital:capital,
@@ -837,6 +862,7 @@ function run(){
         profitFactor,
         avgWin,
         avgLoss,
+        totalFees,
         params,
         strategyStats,
         skipped,
@@ -862,7 +888,7 @@ ${k}：
     }
 
     document.getElementById("out").innerText =
-`【V7.3 强趋势过滤回测报告】
+`【V7.3.1 手续费修复版回测报告】
 
 停止原因：${stoppedReason}
 
@@ -876,11 +902,13 @@ ${k}：
 Profit Factor：${profitFactor.toFixed(2)}
 平均盈利：${avgWin.toFixed(4)}
 平均亏损：${avgLoss.toFixed(4)}
+总手续费：${totalFees.toFixed(4)}
 
 【分策略统计】
 ${strategyText}
 
 【参数】
+随机种子：${params.seed}
 单笔风险：${(params.riskPct*100).toFixed(2)}%
 止损：${(params.stopLossPct*100).toFixed(2)}%
 止盈：${(params.takeProfitPct*100).toFixed(2)}%
@@ -891,13 +919,14 @@ ${strategyText}
 最低信号评分：${params.minScore}
 RANGE策略：${params.enableRange ? "开启" : "关闭"}
 
-【说明】
-✔ 默认关闭震荡交易
-✔ 只做强趋势突破
-✔ 信号评分过滤
-✔ 标准PnL模型
-✔ 分策略统计
-✔ 一键复制报告
+【修复说明】
+✔ 已修复手续费双扣
+✔ 开仓时不再提前扣 openFee
+✔ 平仓时统一扣 openFee + closeFee
+✔ 保留强趋势过滤
+✔ 保留标准PnL模型
+✔ 保留分策略统计
+✔ 保留一键复制报告
 `;
 }
 
