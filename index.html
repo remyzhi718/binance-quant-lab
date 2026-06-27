@@ -1,1325 +1,269 @@
-<!DOCTYPE html>
-<html lang="zh">
-<head>
-<meta charset="UTF-8">
-<title>V7.5 Binance真实K线回测系统</title>
-<style>
-body{
-    background:#0b1220;
-    color:#fff;
-    font-family:Arial, sans-serif;
-    padding:20px;
-}
-h2{margin-top:0}
-.card{
-    background:#162033;
-    padding:15px;
-    border-radius:10px;
-    margin:10px 0;
-}
-button,input,select{
-    padding:10px;
-    margin:6px 0;
-    width:100%;
-    box-sizing:border-box;
-}
-button{
-    background:#f0b90b;
-    border:0;
-    border-radius:6px;
-    font-weight:bold;
-    cursor:pointer;
-}
-pre{
-    background:#101827;
-    padding:12px;
-    border-radius:10px;
-    white-space:pre-wrap;
-    max-height:720px;
-    overflow:auto;
-}
-label{
-    font-size:14px;
-    color:#ddd;
-}
-.small{
-    color:#aaa;
-    font-size:13px;
-}
-</style>
-</head>
-
-<body>
-
-<h2>🚀 V7.5 Binance真实K线回测系统</h2>
-
-<div class="card">
-
-<label>Binance Futures API Base</label>
-<input id="apiBase" value="https://fapi.binance.com">
-
-<label>单币种回测交易对</label>
-<input id="symbol" value="BTCUSDT">
-
-<label>多币种测试，英文逗号分隔</label>
-<input id="symbols" value="BTCUSDT,ETHUSDT,SOLUSDT">
-
-<label>K线周期</label>
-<select id="interval">
-    <option value="5m">5m</option>
-    <option value="15m" selected>15m</option>
-    <option value="30m">30m</option>
-    <option value="1h">1h</option>
-    <option value="4h">4h</option>
-</select>
-
-<label>拉取K线数量，建议 1500 / 3000 / 6000</label>
-<input id="bars" value="3000">
-
-<label>初始资金 USDT</label>
-<input id="initialCapital" value="300">
-
-<label>单笔风险 %</label>
-<input id="riskPct" value="1">
-
-<label>止损 %</label>
-<input id="stopLoss" value="1.5">
-
-<label>止盈 %</label>
-<input id="takeProfit" value="3">
-
-<label>最大名义仓位倍数，1 = 不超过本金</label>
-<input id="maxExposure" value="1">
-
-<label>最大回撤熔断 %</label>
-<input id="maxDDLimit" value="15">
-
-<label>手续费单边 %</label>
-<input id="feePct" value="0.04">
-
-<label>滑点 %</label>
-<input id="slippagePct" value="0.05">
-
-<label>是否开启 TREND_LONG，1=开启，0=关闭</label>
-<input id="enableLong" value="1">
+# v8_clean_backtest.py
+# pip install pandas requests
 
-<label>TREND_LONG 最低评分</label>
-<input id="minScoreLong" value="6">
+import requests
+import pandas as pd
+from datetime import datetime
 
-<label>是否开启 TREND_SHORT，1=开启，0=关闭</label>
-<input id="enableShort" value="0">
+SYMBOL = "BTCUSDT"
+INTERVAL = "15m"
+LIMIT = 1500
 
-<label>TREND_SHORT 最低评分</label>
-<input id="minScoreShort" value="7">
+INITIAL_BALANCE = 300.0
+FEE_RATE = 0.0005
 
-<label>是否开启 RANGE 策略，0=关闭，1=开启</label>
-<input id="enableRange" value="0">
+MA_DENSE_THRESHOLD = 0.003
+VOLUME_MULTIPLIER = 1.3
+BREAKOUT_LOOKBACK = 20
 
-<label>追高/追空过滤 %，价格距离 EMA20 过远不追</label>
-<input id="maxChasePct" value="2.5">
+ATR_PERIOD = 14
+STOP_ATR_MULT = 1.0
+TP1_R = 2.0
+TP2_R = 4.0
+TRAIL_ATR_MULT = 1.2
 
-<label>每笔交易结束后的冷却K线数</label>
-<input id="tradeCooldown" value="12">
+RISK_PCT = 0.01
 
-<label>连续亏损触发冷却笔数</label>
-<input id="lossStreakLimit" value="3">
 
-<label>连续亏损后的冷却K线数</label>
-<input id="lossCooldown" value="60">
+def fetch_klines(symbol, interval, limit=1500):
+    url = "https://api.binance.com/api/v3/klines"
+    params = {"symbol": symbol, "interval": interval, "limit": limit}
+    data = requests.get(url, params=params, timeout=10).json()
 
-<button onclick="runSingleReal()">开始真实K线单币种回测</button>
-<button onclick="runMultiReal()">开始真实K线多币种测试</button>
-<button onclick="copyReport()">📋 一键复制报告</button>
-
-<div class="small">
-V7.5 只做历史K线回测，不下单，不需要 API Key。若出现 Failed to fetch，多半是网络、地区或浏览器跨域限制。
-</div>
+    df = pd.DataFrame(data, columns=[
+        "open_time", "open", "high", "low", "close", "volume",
+        "close_time", "quote_volume", "trades",
+        "taker_buy_base", "taker_buy_quote", "ignore"
+    ])
 
-</div>
+    for col in ["open", "high", "low", "close", "volume"]:
+        df[col] = df[col].astype(float)
 
-<div class="card">
-<pre id="out">等待回测...</pre>
-</div>
+    df["time"] = pd.to_datetime(df["open_time"], unit="ms")
+    return df
 
-<script>
-let lastReport = null;
 
-// ==========================
-// 基础工具
-// ==========================
-function num(id){
-    return Number(document.getElementById(id).value);
-}
+def add_indicators(df):
+    for n in [20, 60, 120]:
+        df[f"ma{n}"] = df["close"].rolling(n).mean()
+        df[f"ema{n}"] = df["close"].ewm(span=n, adjust=False).mean()
 
-function text(id){
-    return document.getElementById(id).value.trim();
-}
+    df["volume_ma20"] = df["volume"].rolling(20).mean()
 
-function avg(arr){
-    if(!arr.length) return 0;
-    return arr.reduce((a,b)=>a+b,0) / arr.length;
-}
+    high_low = df["high"] - df["low"]
+    high_close = (df["high"] - df["close"].shift()).abs()
+    low_close = (df["low"] - df["close"].shift()).abs()
 
-function max(arr){
-    return Math.max(...arr);
-}
+    df["tr"] = pd.concat([high_low, high_close, low_close], axis=1).max(axis=1)
+    df["atr"] = df["tr"].rolling(ATR_PERIOD).mean()
 
-function min(arr){
-    return Math.min(...arr);
-}
+    return df
 
-function sleep(ms){
-    return new Promise(resolve=>setTimeout(resolve, ms));
-}
 
-function fmtTime(ts){
-    let d = new Date(ts);
-    return d.toISOString().replace("T"," ").slice(0,16);
-}
+def check_signal(df, i):
+    row = df.iloc[i]
 
-function setOut(s){
-    document.getElementById("out").innerText = s;
-}
+    ma_cols = ["ma20", "ma60", "ma120", "ema20", "ema60", "ema120"]
 
-// ==========================
-// 读取参数
-// ==========================
-function readParams(){
-    return {
-        apiBase:text("apiBase").replace(/\/$/,""),
-        symbol:text("symbol").toUpperCase(),
-        symbols:text("symbols").split(",").map(x=>x.trim().toUpperCase()).filter(Boolean),
-        interval:text("interval"),
-        bars:num("bars"),
+    if row[ma_cols].isna().any() or pd.isna(row["atr"]):
+        return None
 
-        initialCapital:num("initialCapital"),
+    ma_max = row[ma_cols].max()
+    ma_min = row[ma_cols].min()
+    ma_spread = (ma_max - ma_min) / row["close"]
 
-        riskPct:num("riskPct") / 100,
-        stopLossPct:num("stopLoss") / 100,
-        takeProfitPct:num("takeProfit") / 100,
-        maxExposure:num("maxExposure"),
-        maxDDLimit:num("maxDDLimit") / 100,
-        feePct:num("feePct") / 100,
-        slippagePct:num("slippagePct") / 100,
+    dense = ma_spread < MA_DENSE_THRESHOLD
+    if not dense:
+        return None
 
-        enableLong:num("enableLong") === 1,
-        minScoreLong:num("minScoreLong"),
+    volume_ok = row["volume"] > row["volume_ma20"] * VOLUME_MULTIPLIER
+    if not volume_ok:
+        return None
 
-        enableShort:num("enableShort") === 1,
-        minScoreShort:num("minScoreShort"),
+    recent_high = df["high"].iloc[i - BREAKOUT_LOOKBACK:i].max()
+    recent_low = df["low"].iloc[i - BREAKOUT_LOOKBACK:i].min()
 
-        enableRange:num("enableRange") === 1,
+    if row["close"] > ma_max and row["close"] > recent_high:
+        return "LONG"
 
-        maxChasePct:num("maxChasePct") / 100,
+    if row["close"] < ma_min and row["close"] < recent_low:
+        return "SHORT"
 
-        tradeCooldown:num("tradeCooldown"),
-        lossStreakLimit:num("lossStreakLimit"),
-        lossCooldown:num("lossCooldown"),
+    return None
 
-        maxBarsHeld:100
-    };
-}
 
-// ==========================
-// Binance 真实K线拉取
-// USD-M Futures: /fapi/v1/klines
-// 每次最多1500根，向前分页
-// ==========================
-async function fetchRealKlines(params, symbol){
-    let all = [];
-    let endTime = null;
-    let target = params.bars;
-    let batchLimit = 1500;
+def calc_qty(balance, entry, stop):
+    max_loss = balance * RISK_PCT
+    risk_per_unit = abs(entry - stop)
 
-    while(all.length < target){
-        let limit = Math.min(batchLimit, target - all.length);
+    if risk_per_unit <= 0:
+        return 0
 
-        let url = `${params.apiBase}/fapi/v1/klines?symbol=${symbol}&interval=${params.interval}&limit=${limit}`;
-
-        if(endTime){
-            url += `&endTime=${endTime}`;
-        }
-
-        setOut(`正在拉取真实K线...\n交易对：${symbol}\n周期：${params.interval}\n已获取：${all.length}/${target}`);
-
-        let res;
-
-        try{
-            res = await fetch(url);
-        }catch(e){
-            throw new Error("网络请求失败。可能是 Binance 访问受限、浏览器跨域、网络问题。错误：" + e.message);
-        }
-
-        if(!res.ok){
-            let body = await res.text();
-            throw new Error(`Binance接口错误：HTTP ${res.status}\n${body}`);
-        }
-
-        let data = await res.json();
-
-        if(!Array.isArray(data) || data.length === 0){
-            break;
-        }
-
-        all = data.concat(all);
-
-        let firstOpenTime = data[0][0];
-        endTime = firstOpenTime - 1;
-
-        if(data.length < limit){
-            break;
-        }
-
-        await sleep(180);
-    }
-
-    // 去重 + 排序
-    let map = new Map();
-
-    for(let k of all){
-        map.set(k[0], k);
-    }
-
-    let unique = Array.from(map.values()).sort((a,b)=>a[0]-b[0]);
-
-    // 删除未收盘K线
-    let now = Date.now();
-    unique = unique.filter(k => k[6] < now);
-
-    // 只保留最后 target 根
-    unique = unique.slice(-target);
-
-    let bars = unique.map(k=>({
-        openTime:Number(k[0]),
-        open:Number(k[1]),
-        high:Number(k[2]),
-        low:Number(k[3]),
-        close:Number(k[4]),
-        vol:Number(k[5]),
-        closeTime:Number(k[6])
-    }));
-
-    if(bars.length < 200){
-        throw new Error(`K线数量太少：${bars.length}，无法回测`);
-    }
-
-    return bars;
-}
-
-// ==========================
-// EMA / ATR
-// ==========================
-function ema(values, period){
-    if(values.length === 0) return 0;
-
-    let k = 2 / (period + 1);
-    let e = values[0];
-
-    for(let i=1;i<values.length;i++){
-        e = values[i] * k + e * (1-k);
-    }
-
-    return e;
-}
-
-function atr(data, i, period){
-    let trs = [];
-
-    for(let j=i-period+1;j<=i;j++){
-        if(j <= 0) continue;
-
-        let h = data[j].high;
-        let l = data[j].low;
-        let pc = data[j-1].close;
-
-        trs.push(Math.max(
-            h-l,
-            Math.abs(h-pc),
-            Math.abs(l-pc)
-        ));
-    }
-
-    return avg(trs);
-}
-
-// ==========================
-// 市场状态识别
-// ==========================
-function marketState(d, i){
-    if(i < 150) return {
-        state:"UNKNOWN",
-        ema20:0,
-        ema80:0,
-        atrPct:0,
-        trendStrength:0,
-        slope:0
-    };
-
-    let s120 = d.slice(i-120, i);
-    let s60 = d.slice(i-60, i);
-    let s30 = d.slice(i-30, i);
-
-    let closes120 = s120.map(x=>x.close);
-    let closes60 = s60.map(x=>x.close);
-    let closes30 = s30.map(x=>x.close);
-
-    let ema20 = ema(closes120, 20);
-    let ema80 = ema(closes120, 80);
-
-    let ema20Now = ema(closes30, 20);
-    let ema20Past = ema(closes60.slice(0,30), 20);
-
-    let slope = (ema20Now - ema20Past) / d[i].close;
-
-    let currentAtr = atr(d, i, 14);
-    let atrPct = currentAtr / d[i].close;
-
-    let trendStrength = Math.abs(ema20 - ema80) / d[i].close;
-
-    if(atrPct > 0.035){
-        return {
-            state:"VOLATILE",
-            ema20,
-            ema80,
-            atrPct,
-            trendStrength,
-            slope
-        };
-    }
-
-    if(ema20 > ema80 && slope > 0.0005 && trendStrength > 0.004){
-        return {
-            state:"TREND_UP",
-            ema20,
-            ema80,
-            atrPct,
-            trendStrength,
-            slope
-        };
-    }
-
-    if(ema20 < ema80 && slope < -0.0005 && trendStrength > 0.004){
-        return {
-            state:"TREND_DOWN",
-            ema20,
-            ema80,
-            atrPct,
-            trendStrength,
-            slope
-        };
-    }
-
-    return {
-        state:"RANGE",
-        ema20,
-        ema80,
-        atrPct,
-        trendStrength,
-        slope
-    };
-}
-
-// ==========================
-// 风险过滤
-// ==========================
-function riskFilter(d, i){
-    let c = d[i];
-
-    let body = Math.max(Math.abs(c.open - c.close), c.close * 0.0001);
-    let upperWick = c.high - Math.max(c.open, c.close);
-    let lowerWick = Math.min(c.open, c.close) - c.low;
-
-    // 防插针
-    if(upperWick / body > 4 || lowerWick / body > 4){
-        return false;
-    }
-
-    // 防极端单根波动
-    let rangePct = (c.high - c.low) / c.close;
-
-    if(rangePct > 0.035){
-        return false;
-    }
-
-    return true;
-}
-
-// ==========================
-// TREND_LONG 评分
-// ==========================
-function scoreTrendLong(d, i, ms){
-    let s20 = d.slice(i-20, i);
-    let s50 = d.slice(i-50, i);
-
-    let price = d[i].close;
-    let prevHigh20 = max(s20.map(x=>x.high));
-    let prevHigh50 = max(s50.map(x=>x.high));
-    let volAvg20 = avg(s20.map(x=>x.vol));
-
-    let score = 0;
-    let reasons = [];
-
-    if(ms.state === "TREND_UP"){
-        score++;
-        reasons.push("TREND_UP");
-    }
-
-    if(price > prevHigh20){
-        score++;
-        reasons.push("突破20高");
-    }
-
-    if(price > prevHigh50 * 0.995){
-        score++;
-        reasons.push("接近/突破50高");
-    }
-
-    if(ms.ema20 > ms.ema80){
-        score++;
-        reasons.push("EMA多头");
-    }
-
-    if(ms.slope > 0.0005){
-        score++;
-        reasons.push("斜率向上");
-    }
-
-    if(d[i].vol > volAvg20 * 1.2){
-        score++;
-        reasons.push("放量");
-    }
-
-    if(ms.atrPct > 0.003 && ms.atrPct < 0.03){
-        score++;
-        reasons.push("ATR正常");
-    }
-
-    return {score, reasons};
-}
-
-// ==========================
-// TREND_SHORT 评分
-// ==========================
-function scoreTrendShort(d, i, ms){
-    let s20 = d.slice(i-20, i);
-    let s50 = d.slice(i-50, i);
-
-    let price = d[i].close;
-    let prevLow20 = min(s20.map(x=>x.low));
-    let prevLow50 = min(s50.map(x=>x.low));
-    let volAvg20 = avg(s20.map(x=>x.vol));
-
-    let score = 0;
-    let reasons = [];
-
-    if(ms.state === "TREND_DOWN"){
-        score++;
-        reasons.push("TREND_DOWN");
-    }
-
-    if(price < prevLow20){
-        score++;
-        reasons.push("跌破20低");
-    }
-
-    if(price < prevLow50 * 1.005){
-        score++;
-        reasons.push("接近/跌破50低");
-    }
-
-    if(ms.ema20 < ms.ema80){
-        score++;
-        reasons.push("EMA空头");
-    }
-
-    if(ms.slope < -0.0005){
-        score++;
-        reasons.push("斜率向下");
-    }
-
-    if(d[i].vol > volAvg20 * 1.2){
-        score++;
-        reasons.push("放量");
-    }
-
-    if(ms.atrPct > 0.003 && ms.atrPct < 0.03){
-        score++;
-        reasons.push("ATR正常");
-    }
-
-    return {score, reasons};
-}
-
-// ==========================
-// RANGE 策略，默认关闭
-// ==========================
-function rangeSignal(d, i){
-    let s20 = d.slice(i-20, i);
-    let mean = avg(s20.map(x=>x.close));
-    let currentAtr = atr(d, i, 14);
-    let price = d[i].close;
-
-    if(price < mean - currentAtr * 1.2){
-        return {
-            direction:"LONG",
-            strategy:"RANGE_LONG",
-            score:3,
-            reasons:["均值回归做多"]
-        };
-    }
-
-    if(price > mean + currentAtr * 1.2){
-        return {
-            direction:"SHORT",
-            strategy:"RANGE_SHORT",
-            score:3,
-            reasons:["均值回归做空"]
-        };
-    }
-
-    return null;
-}
-
-// ==========================
-// 信号函数
-// 信号在第 i 根K线收盘确认
-// 下一根K线开盘执行
-// ==========================
-function signal(d, i, params){
-    if(i < 160) return null;
-
-    if(!riskFilter(d, i)) return null;
-
-    let ms = marketState(d, i);
-
-    if(ms.state === "UNKNOWN" || ms.state === "VOLATILE"){
-        return null;
-    }
-
-    let price = d[i].close;
-
-    if(params.enableLong && ms.state === "TREND_UP"){
-        let longScore = scoreTrendLong(d, i, ms);
-        let chasePct = (price - ms.ema20) / price;
-
-        if(
-            longScore.score >= params.minScoreLong &&
-            chasePct <= params.maxChasePct
-        ){
-            return {
-                direction:"LONG",
-                strategy:"TREND_LONG",
-                score:longScore.score,
-                reasons:longScore.reasons.concat([
-                    "追高距离：" + (chasePct*100).toFixed(2) + "%"
-                ]),
-                marketState:ms.state
-            };
-        }
-    }
-
-    if(params.enableShort && ms.state === "TREND_DOWN"){
-        let shortScore = scoreTrendShort(d, i, ms);
-        let chasePct = (ms.ema20 - price) / price;
-
-        if(
-            shortScore.score >= params.minScoreShort &&
-            chasePct <= params.maxChasePct
-        ){
-            return {
-                direction:"SHORT",
-                strategy:"TREND_SHORT",
-                score:shortScore.score,
-                reasons:shortScore.reasons.concat([
-                    "追空距离：" + (chasePct*100).toFixed(2) + "%"
-                ]),
-                marketState:ms.state
-            };
-        }
-    }
-
-    if(params.enableRange){
-        let r = rangeSignal(d, i);
-
-        if(r){
-            return {
-                ...r,
-                marketState:ms.state
-            };
-        }
-    }
-
-    return null;
-}
-
-// ==========================
-// 仓位模型
-// ==========================
-function calcNotional(capital, riskPct, stopLossPct, maxExposure){
-    let riskAmount = capital * riskPct;
-    let rawNotional = riskAmount / stopLossPct;
-    let maxNotional = capital * maxExposure;
-
-    return Math.min(rawNotional, maxNotional);
-}
-
-// ==========================
-// 开仓
-// ==========================
-function openPosition(sig, rawPrice, capital, params, entryIndex){
-    let notional = calcNotional(
-        capital,
-        params.riskPct,
-        params.stopLossPct,
-        params.maxExposure
-    );
-
-    if(notional <= 0) return null;
-
-    let entry;
-
-    if(sig.direction === "LONG"){
-        entry = rawPrice * (1 + params.slippagePct);
-    }else{
-        entry = rawPrice * (1 - params.slippagePct);
-    }
-
-    let openFee = notional * params.feePct;
-
-    return {
-        direction:sig.direction,
-        strategy:sig.strategy,
-        score:sig.score,
-        reasons:sig.reasons,
-        marketState:sig.marketState,
-        entry,
-        notional,
-        openFee,
-        barsHeld:0,
-        entryIndex
-    };
-}
-
-// ==========================
-// 平仓判断
-// ==========================
-function checkExit(pos, bar, params){
-    pos.barsHeld++;
-
-    let sl = params.stopLossPct;
-    let tp = params.takeProfitPct;
-
-    let exitPrice = null;
-    let reason = null;
-
-    if(pos.direction === "LONG"){
-        let stop = pos.entry * (1 - sl);
-        let take = pos.entry * (1 + tp);
-
-        // 同一根K线同时触发，保守按止损
-        if(bar.low <= stop){
-            exitPrice = stop * (1 - params.slippagePct);
-            reason = "STOP";
-        }else if(bar.high >= take){
-            exitPrice = take * (1 - params.slippagePct);
-            reason = "TAKE";
-        }
-    }
-
-    if(pos.direction === "SHORT"){
-        let stop = pos.entry * (1 + sl);
-        let take = pos.entry * (1 - tp);
-
-        if(bar.high >= stop){
-            exitPrice = stop * (1 + params.slippagePct);
-            reason = "STOP";
-        }else if(bar.low <= take){
-            exitPrice = take * (1 + params.slippagePct);
-            reason = "TAKE";
-        }
-    }
-
-    if(!exitPrice && pos.barsHeld >= params.maxBarsHeld){
-        exitPrice = bar.close;
-        reason = "TIME_EXIT";
-    }
-
-    if(!exitPrice) return null;
-
-    return {exitPrice, reason};
-}
-
-// ==========================
-// 最终强制平仓
-// ==========================
-function finalExitPrice(pos, rawPrice, params){
-    if(pos.direction === "LONG"){
-        return rawPrice * (1 - params.slippagePct);
-    }
-
-    return rawPrice * (1 + params.slippagePct);
-}
-
-// ==========================
-// 平仓PnL
-// 手续费只在这里统一扣一次
-// ==========================
-function closePosition(pos, exitPrice, capital, params){
-    let directionNum = pos.direction === "LONG" ? 1 : -1;
-
-    let pnlPct = directionNum * (exitPrice - pos.entry) / pos.entry;
-    let grossPnl = pos.notional * pnlPct;
-    let closeFee = pos.notional * params.feePct;
-    let totalFee = pos.openFee + closeFee;
-    let netPnl = grossPnl - totalFee;
-
-    let capitalBefore = capital;
-    let capitalAfter = capital + netPnl;
-
-    return {
-        capitalAfter,
-        trade:{
-            direction:pos.direction,
-            strategy:pos.strategy,
-            marketState:pos.marketState,
-            score:pos.score,
-            reasons:pos.reasons,
-            entry:pos.entry,
-            exit:exitPrice,
-            notional:pos.notional,
-            pnlPct,
-            grossPnl,
-            openFee:pos.openFee,
-            closeFee,
-            totalFee,
-            netPnl,
-            returnOnCapital:netPnl / capitalBefore,
-            barsHeld:pos.barsHeld
-        }
-    };
-}
-
-// ==========================
-// 分策略统计
-// ==========================
-function calcStrategyStats(trades){
-    let map = {};
-
-    for(let t of trades){
-        if(!map[t.strategy]){
-            map[t.strategy] = {
-                count:0,
-                wins:0,
-                losses:0,
-                netPnl:0,
-                grossProfit:0,
-                grossLoss:0,
-                avgScore:0,
-                avgBarsHeld:0
-            };
-        }
-
-        let s = map[t.strategy];
-
-        s.count++;
-        s.netPnl += t.netPnl;
-        s.avgScore += t.score || 0;
-        s.avgBarsHeld += t.barsHeld || 0;
-
-        if(t.netPnl > 0){
-            s.wins++;
-            s.grossProfit += t.netPnl;
-        }else{
-            s.losses++;
-            s.grossLoss += Math.abs(t.netPnl);
-        }
-    }
-
-    for(let k in map){
-        let s = map[k];
-
-        s.winRate = s.count ? s.wins / s.count : 0;
-        s.profitFactor = s.grossLoss === 0 ? 999 : s.grossProfit / s.grossLoss;
-        s.avgScore = s.count ? s.avgScore / s.count : 0;
-        s.avgBarsHeld = s.count ? s.avgBarsHeld / s.count : 0;
-    }
-
-    return map;
-}
-
-// ==========================
-// 回测核心
-// ==========================
-function backtestRealData(d, params, symbol){
-    let capital = params.initialCapital;
-    let peak = params.initialCapital;
-    let maxDD = 0;
-
-    let position = null;
-    let trades = [];
-
-    let cooldown = 0;
-    let consecutiveLoss = 0;
-
-    let stoppedReason = "正常完成";
-
-    let skipped = {
-        cooldown:0,
-        noSignal:0
-    };
-
-    let stateCounts = {
-        UNKNOWN:0,
-        VOLATILE:0,
-        TREND_UP:0,
-        TREND_DOWN:0,
-        RANGE:0
-    };
-
-    function updateDrawdown(){
-        if(capital > peak){
-            peak = capital;
-        }
-
-        let dd = (peak - capital) / peak;
-
-        if(dd > maxDD){
-            maxDD = dd;
-        }
-
-        return dd;
-    }
-
-    for(let i=170;i<d.length-1;i++){
-
-        let ms = marketState(d, i);
-        stateCounts[ms.state] = (stateCounts[ms.state] || 0) + 1;
-
-        if(capital <= 0){
-            capital = 0;
-            stoppedReason = "资金归零";
-            break;
-        }
-
-        let dd = updateDrawdown();
-
-        if(dd >= params.maxDDLimit){
-            stoppedReason = "最大回撤超过限制，停止交易";
-            break;
-        }
-
-        // 先管理持仓，用当前K线检查止盈止损
-        if(position && i >= position.entryIndex){
-            let exit = checkExit(position, d[i], params);
-
-            if(exit){
-                let result = closePosition(position, exit.exitPrice, capital, params);
-                capital = result.capitalAfter;
-
-                result.trade.reason = exit.reason;
-                result.trade.capitalAfter = capital;
-                result.trade.symbol = symbol;
-                result.trade.exitTime = d[i].closeTime;
-
-                trades.push(result.trade);
-
-                if(result.trade.netPnl < 0){
-                    consecutiveLoss++;
-                }else{
-                    consecutiveLoss = 0;
+    return max_loss / risk_per_unit
+
+
+def backtest(df):
+    balance = INITIAL_BALANCE
+    position = None
+    trades = []
+    peak_balance = balance
+    max_drawdown = 0
+
+    start_i = max(130, BREAKOUT_LOOKBACK + 1)
+
+    for i in range(start_i, len(df)):
+        row = df.iloc[i]
+
+        if position:
+            side = position["side"]
+            entry = position["entry"]
+            qty = position["qty"]
+            stop = position["stop"]
+            tp1 = position["tp1"]
+            tp2 = position["tp2"]
+
+            exit_price = None
+            exit_reason = None
+
+            if side == "LONG":
+                position["highest"] = max(position["highest"], row["high"])
+                trail_stop = position["highest"] - row["atr"] * TRAIL_ATR_MULT
+                stop = max(stop, trail_stop)
+
+                if row["low"] <= stop:
+                    exit_price = stop
+                    exit_reason = "STOP/TRAIL"
+                elif row["high"] >= tp2:
+                    exit_price = tp2
+                    exit_reason = "TP2"
+                elif row["high"] >= tp1 and not position["tp1_hit"]:
+                    position["tp1_hit"] = True
+                    position["stop"] = entry
+                    continue
+
+            if side == "SHORT":
+                position["lowest"] = min(position["lowest"], row["low"])
+                trail_stop = position["lowest"] + row["atr"] * TRAIL_ATR_MULT
+                stop = min(stop, trail_stop)
+
+                if row["high"] >= stop:
+                    exit_price = stop
+                    exit_reason = "STOP/TRAIL"
+                elif row["low"] <= tp2:
+                    exit_price = tp2
+                    exit_reason = "TP2"
+                elif row["low"] <= tp1 and not position["tp1_hit"]:
+                    position["tp1_hit"] = True
+                    position["stop"] = entry
+                    continue
+
+            position["stop"] = stop
+
+            if exit_price:
+                if side == "LONG":
+                    pnl = (exit_price - entry) * qty
+                else:
+                    pnl = (entry - exit_price) * qty
+
+                fee = (entry * qty + exit_price * qty) * FEE_RATE
+                pnl -= fee
+                balance += pnl
+
+                trades.append({
+                    "time": row["time"],
+                    "side": side,
+                    "entry": entry,
+                    "exit": exit_price,
+                    "pnl": pnl,
+                    "balance": balance,
+                    "reason": exit_reason
+                })
+
+                peak_balance = max(peak_balance, balance)
+                dd = (peak_balance - balance) / peak_balance
+                max_drawdown = max(max_drawdown, dd)
+
+                position = None
+
+        else:
+            signal = check_signal(df, i)
+            if not signal:
+                continue
+
+            entry = row["close"]
+            atr = row["atr"]
+
+            if signal == "LONG":
+                stop = entry - atr * STOP_ATR_MULT
+                risk = entry - stop
+                tp1 = entry + risk * TP1_R
+                tp2 = entry + risk * TP2_R
+                qty = calc_qty(balance, entry, stop)
+
+                position = {
+                    "side": "LONG",
+                    "entry": entry,
+                    "qty": qty,
+                    "stop": stop,
+                    "tp1": tp1,
+                    "tp2": tp2,
+                    "tp1_hit": False,
+                    "highest": row["high"]
                 }
 
-                cooldown = Math.max(cooldown, params.tradeCooldown);
+            elif signal == "SHORT":
+                stop = entry + atr * STOP_ATR_MULT
+                risk = stop - entry
+                tp1 = entry - risk * TP1_R
+                tp2 = entry - risk * TP2_R
+                qty = calc_qty(balance, entry, stop)
 
-                if(consecutiveLoss >= params.lossStreakLimit){
-                    cooldown = Math.max(cooldown, params.lossCooldown);
-                    consecutiveLoss = 0;
+                position = {
+                    "side": "SHORT",
+                    "entry": entry,
+                    "qty": qty,
+                    "stop": stop,
+                    "tp1": tp1,
+                    "tp2": tp2,
+                    "tp1_hit": False,
+                    "lowest": row["low"]
                 }
 
-                position = null;
-
-                dd = updateDrawdown();
-
-                if(dd >= params.maxDDLimit){
-                    stoppedReason = "最大回撤超过限制，停止交易";
-                    break;
-                }
-            }
-        }
-
-        if(cooldown > 0){
-            cooldown--;
-            skipped.cooldown++;
-            continue;
-        }
-
-        // 无持仓才开仓
-        if(!position){
-            let sig = signal(d, i, params);
-
-            if(sig){
-                let entryBar = d[i+1];
-
-                position = openPosition(
-                    sig,
-                    entryBar.open,
-                    capital,
-                    params,
-                    i+1
-                );
-
-                if(position){
-                    position.entryTime = entryBar.openTime;
-                }
-            }else{
-                skipped.noSignal++;
-            }
-        }
-    }
-
-    // 最后一根强制平仓
-    if(position && capital > 0){
-        let lastBar = d[d.length-1];
-        let exitPrice = finalExitPrice(position, lastBar.close, params);
-        let result = closePosition(position, exitPrice, capital, params);
-
-        capital = result.capitalAfter;
-
-        result.trade.reason = "FINAL_EXIT";
-        result.trade.capitalAfter = capital;
-        result.trade.symbol = symbol;
-        result.trade.exitTime = lastBar.closeTime;
-
-        trades.push(result.trade);
-
-        updateDrawdown();
-    }
-
-    let wins = trades.filter(t=>t.netPnl > 0);
-    let losses = trades.filter(t=>t.netPnl <= 0);
-
-    let grossProfit = wins.reduce((a,b)=>a+b.netPnl,0);
-    let grossLoss = Math.abs(losses.reduce((a,b)=>a+b.netPnl,0));
-
-    let winRate = trades.length ? wins.length / trades.length : 0;
-    let profitFactor = grossLoss === 0 ? 999 : grossProfit / grossLoss;
-
-    let avgWin = wins.length ? grossProfit / wins.length : 0;
-    let avgLoss = losses.length ? grossLoss / losses.length : 0;
-    let totalFees = trades.reduce((a,b)=>a+b.totalFee,0);
-
-    let strategyStats = calcStrategyStats(trades);
-
-    return {
-        version:"V7.5 Binance真实K线回测",
-        symbol,
-        interval:params.interval,
-        dataBars:d.length,
-        dataStart:fmtTime(d[0].openTime),
-        dataEnd:fmtTime(d[d.length-1].closeTime),
-        stoppedReason,
-        initialCapital:params.initialCapital,
-        finalCapital:capital,
-        returnRate:(capital - params.initialCapital) / params.initialCapital,
-        maxDrawdown:maxDD,
-        tradesCount:trades.length,
-        winRate,
-        profitFactor,
-        avgWin,
-        avgLoss,
-        totalFees,
-        strategyStats,
-        stateCounts,
-        skipped,
-        params:{
-            riskPct:params.riskPct,
-            stopLossPct:params.stopLossPct,
-            takeProfitPct:params.takeProfitPct,
-            maxExposure:params.maxExposure,
-            maxDDLimit:params.maxDDLimit,
-            feePct:params.feePct,
-            slippagePct:params.slippagePct,
-            enableLong:params.enableLong,
-            minScoreLong:params.minScoreLong,
-            enableShort:params.enableShort,
-            minScoreShort:params.minScoreShort,
-            enableRange:params.enableRange,
-            maxChasePct:params.maxChasePct,
-            tradeCooldown:params.tradeCooldown,
-            lossStreakLimit:params.lossStreakLimit,
-            lossCooldown:params.lossCooldown
-        },
-        lastTrades:trades.slice(-50)
-    };
-}
-
-// ==========================
-// 单币种真实回测
-// ==========================
-async function runSingleReal(){
-    let params = readParams();
-
-    try{
-        setOut("准备拉取真实K线...");
-        let d = await fetchRealKlines(params, params.symbol);
-        let report = backtestRealData(d, params, params.symbol);
-
-        lastReport = report;
-
-        displaySingleReport(report);
-    }catch(e){
-        setOut("❌ 回测失败：\n\n" + e.message);
-    }
-}
-
-// ==========================
-// 多币种真实测试
-// ==========================
-async function runMultiReal(){
-    let params = readParams();
-    let reports = [];
-
-    try{
-        for(let i=0;i<params.symbols.length;i++){
-            let sym = params.symbols[i];
-
-            setOut(`正在测试多币种...\n进度：${i+1}/${params.symbols.length}\n当前：${sym}`);
-
-            let d = await fetchRealKlines(params, sym);
-            let r = backtestRealData(d, params, sym);
-
-            reports.push(r);
-
-            await sleep(300);
-        }
-
-        let validPF = reports.map(r=>r.profitFactor >= 999 ? 10 : r.profitFactor);
-
-        let avgReturn = avg(reports.map(r=>r.returnRate));
-        let avgDD = avg(reports.map(r=>r.maxDrawdown));
-        let avgPF = avg(validPF);
-        let avgTrades = avg(reports.map(r=>r.tradesCount));
-        let positive = reports.filter(r=>r.returnRate > 0).length;
-        let ddStop = reports.filter(r=>r.stoppedReason.includes("最大回撤")).length;
-
-        let best = reports.reduce((a,b)=>a.returnRate > b.returnRate ? a : b);
-        let worst = reports.reduce((a,b)=>a.returnRate < b.returnRate ? a : b);
-
-        lastReport = {
-            version:"V7.5 Binance真实K线多币种测试",
-            interval:params.interval,
-            bars:params.bars,
-            symbols:params.symbols,
-            aggregate:{
-                avgReturn,
-                avgDrawdown:avgDD,
-                avgProfitFactor:avgPF,
-                avgTrades,
-                positiveRuns:positive,
-                positiveRate:positive / reports.length,
-                stoppedByDD:ddStop,
-                best:{
-                    symbol:best.symbol,
-                    returnRate:best.returnRate,
-                    finalCapital:best.finalCapital,
-                    profitFactor:best.profitFactor
-                },
-                worst:{
-                    symbol:worst.symbol,
-                    returnRate:worst.returnRate,
-                    finalCapital:worst.finalCapital,
-                    profitFactor:worst.profitFactor
-                }
-            },
-            reports:reports.map(r=>({
-                symbol:r.symbol,
-                interval:r.interval,
-                dataStart:r.dataStart,
-                dataEnd:r.dataEnd,
-                finalCapital:r.finalCapital,
-                returnRate:r.returnRate,
-                maxDrawdown:r.maxDrawdown,
-                tradesCount:r.tradesCount,
-                winRate:r.winRate,
-                profitFactor:r.profitFactor,
-                totalFees:r.totalFees,
-                stoppedReason:r.stoppedReason,
-                strategyStats:r.strategyStats
-            }))
-        };
-
-        displayMultiReport(lastReport);
-    }catch(e){
-        setOut("❌ 多币种测试失败：\n\n" + e.message);
-    }
-}
-
-// ==========================
-// 展示单次报告
-// ==========================
-function displaySingleReport(r){
-    let strategyText = "";
-
-    for(let k in r.strategyStats){
-        let s = r.strategyStats[k];
-
-        strategyText += `
-${k}：
-  交易次数：${s.count}
-  胜率：${(s.winRate*100).toFixed(2)}%
-  净收益：${s.netPnl.toFixed(4)}
-  Profit Factor：${s.profitFactor.toFixed(2)}
-  平均评分：${s.avgScore.toFixed(2)}
-  平均持仓K线：${s.avgBarsHeld.toFixed(2)}
-`;
-    }
-
-    if(!strategyText){
-        strategyText = "暂无交易";
-    }
-
-    document.getElementById("out").innerText =
-`【V7.5 Binance真实K线单币种回测报告】
-
-交易对：${r.symbol}
-周期：${r.interval}
-K线数量：${r.dataBars}
-数据区间：${r.dataStart} → ${r.dataEnd}
-
-停止原因：${r.stoppedReason}
-
-初始资金：${r.initialCapital.toFixed(2)}
-最终资金：${r.finalCapital.toFixed(2)}
-收益率：${(r.returnRate*100).toFixed(2)}%
-
-最大回撤：${(r.maxDrawdown*100).toFixed(2)}%
-交易次数：${r.tradesCount}
-胜率：${(r.winRate*100).toFixed(2)}%
-Profit Factor：${r.profitFactor.toFixed(2)}
-平均盈利：${r.avgWin.toFixed(4)}
-平均亏损：${r.avgLoss.toFixed(4)}
-总手续费：${r.totalFees.toFixed(4)}
-
-【分策略统计】
-${strategyText}
-
-【市场状态统计】
-UNKNOWN：${r.stateCounts.UNKNOWN || 0}
-VOLATILE：${r.stateCounts.VOLATILE || 0}
-TREND_UP：${r.stateCounts.TREND_UP || 0}
-TREND_DOWN：${r.stateCounts.TREND_DOWN || 0}
-RANGE：${r.stateCounts.RANGE || 0}
-
-【参数】
-单笔风险：${(r.params.riskPct*100).toFixed(2)}%
-止损：${(r.params.stopLossPct*100).toFixed(2)}%
-止盈：${(r.params.takeProfitPct*100).toFixed(2)}%
-最大名义仓位：${r.params.maxExposure}x
-最大回撤熔断：${(r.params.maxDDLimit*100).toFixed(2)}%
-手续费：${(r.params.feePct*100).toFixed(3)}%
-滑点：${(r.params.slippagePct*100).toFixed(3)}%
-
-TREND_LONG：${r.params.enableLong ? "开启" : "关闭"}
-LONG最低评分：${r.params.minScoreLong}
-
-TREND_SHORT：${r.params.enableShort ? "开启" : "关闭"}
-SHORT最低评分：${r.params.minScoreShort}
-
-RANGE策略：${r.params.enableRange ? "开启" : "关闭"}
-追高/追空过滤：${(r.params.maxChasePct*100).toFixed(2)}%
-交易冷却：${r.params.tradeCooldown} 根K线
-连亏冷却：${r.params.lossCooldown} 根K线
-
-【说明】
-✔ 使用 Binance 真实历史K线
-✔ 不使用未来函数
-✔ 信号收盘确认，下一根开盘执行
-✔ 标准PnL模型
-✔ 手续费/滑点
-✔ 最大回撤熔断
-✔ 一键复制报告
-`;
-}
-
-// ==========================
-// 展示多币种报告
-// ==========================
-function displayMultiReport(r){
-    let lines = r.reports.map(x=>{
-        return `${x.symbol} | 收益 ${(x.returnRate*100).toFixed(2)}% | DD ${(x.maxDrawdown*100).toFixed(2)}% | PF ${x.profitFactor.toFixed(2)} | 交易 ${x.tradesCount} | ${x.stoppedReason}`;
-    }).join("\n");
-
-    document.getElementById("out").innerText =
-`【V7.5 Binance真实K线多币种测试报告】
-
-周期：${r.interval}
-K线数量：${r.bars}
-交易对：${r.symbols.join(", ")}
-
-平均收益率：${(r.aggregate.avgReturn*100).toFixed(2)}%
-平均最大回撤：${(r.aggregate.avgDrawdown*100).toFixed(2)}%
-平均 Profit Factor：${r.aggregate.avgProfitFactor.toFixed(2)}
-平均交易次数：${r.aggregate.avgTrades.toFixed(2)}
-
-盈利数量：${r.aggregate.positiveRuns} / ${r.reports.length}
-盈利占比：${(r.aggregate.positiveRate*100).toFixed(2)}%
-
-触发最大回撤数量：${r.aggregate.stoppedByDD} / ${r.reports.length}
-
-最佳：
-${r.aggregate.best.symbol}
-收益率：${(r.aggregate.best.returnRate*100).toFixed(2)}%
-最终资金：${r.aggregate.best.finalCapital.toFixed(2)}
-PF：${r.aggregate.best.profitFactor.toFixed(2)}
-
-最差：
-${r.aggregate.worst.symbol}
-收益率：${(r.aggregate.worst.returnRate*100).toFixed(2)}%
-最终资金：${r.aggregate.worst.finalCapital.toFixed(2)}
-PF：${r.aggregate.worst.profitFactor.toFixed(2)}
-
-【逐个交易对】
-${lines}
-
-【判断】
-真实K线比模拟更重要。
-如果多币种平均 PF > 1.10、盈利占比 ≥ 60%、平均回撤 < 15%，才继续优化。
-如果真实K线明显变差，说明模拟策略过拟合，不能实盘。
-`;
-}
-
-// ==========================
-// 一键复制
-// ==========================
-function copyReport(){
-    if(!lastReport){
-        alert("请先运行回测");
-        return;
-    }
-
-    let text = JSON.stringify(lastReport, null, 2);
-
-    if(navigator.clipboard && navigator.clipboard.writeText){
-        navigator.clipboard.writeText(text).then(()=>{
-            alert("已复制，可直接粘贴给ChatGPT分析");
-        }).catch(()=>{
-            fallbackCopy(text);
-        });
-    }else{
-        fallbackCopy(text);
-    }
-}
-
-function fallbackCopy(text){
-    let textarea = document.createElement("textarea");
-    textarea.value = text;
-    document.body.appendChild(textarea);
-    textarea.select();
-    document.execCommand("copy");
-    document.body.removeChild(textarea);
-    alert("已复制，可直接粘贴给ChatGPT分析");
-}
-</script>
-
-</body>
-</html>
+    return balance, trades, max_drawdown
+
+
+def report(balance, trades, max_drawdown):
+    wins = [t for t in trades if t["pnl"] > 0]
+    losses = [t for t in trades if t["pnl"] <= 0]
+
+    total_profit = sum(t["pnl"] for t in wins)
+    total_loss = abs(sum(t["pnl"] for t in losses))
+
+    win_rate = len(wins) / len(trades) * 100 if trades else 0
+    pf = total_profit / total_loss if total_loss > 0 else 0
+
+    print("\n【V8 六均线密集突破回测报告】")
+    print(f"交易对：{SYMBOL}")
+    print(f"周期：{INTERVAL}")
+    print(f"初始资金：{INITIAL_BALANCE:.2f}")
+    print(f"最终资金：{balance:.2f}")
+    print(f"收益率：{(balance / INITIAL_BALANCE - 1) * 100:.2f}%")
+    print(f"最大回撤：{max_drawdown * 100:.2f}%")
+    print(f"交易次数：{len(trades)}")
+    print(f"胜率：{win_rate:.2f}%")
+    print(f"Profit Factor：{pf:.2f}")
+
+    print("\n最近10笔交易：")
+    for t in trades[-10:]:
+        print(
+            f"{t['time']} | {t['side']} | "
+            f"entry={t['entry']:.2f} exit={t['exit']:.2f} "
+            f"pnl={t['pnl']:.4f} | {t['reason']}"
+        )
+
+
+if __name__ == "__main__":
+    df = fetch_klines(SYMBOL, INTERVAL, LIMIT)
+    df = add_indicators(df)
+    balance, trades, max_drawdown = backtest(df)
+    report(balance, trades, max_drawdown)
