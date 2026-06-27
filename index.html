@@ -1,9 +1,24 @@
-# v8_clean_backtest.py
+from pathlib import Path
+
+code = r'''# v8_2_six_ma_breakout_backtest.py
+# 六均线密集突破 V8.2 回测版
+# 逻辑：六均线连续密集 -> 放量收盘突破 -> 30%追击仓位 -> 回踩确认加70% -> ATR止损 -> 移动止盈
+#
+# 安装依赖：
 # pip install pandas requests
+#
+# 运行：
+# python v8_2_six_ma_breakout_backtest.py
 
 import requests
 import pandas as pd
-from datetime import datetime
+from dataclasses import dataclass
+from typing import Optional, List, Dict
+
+
+# =========================
+# 参数区
+# =========================
 
 SYMBOL = "BTCUSDT"
 INTERVAL = "15m"
@@ -12,23 +27,62 @@ LIMIT = 1500
 INITIAL_BALANCE = 300.0
 FEE_RATE = 0.0005
 
-MA_DENSE_THRESHOLD = 0.003
-VOLUME_MULTIPLIER = 1.3
-BREAKOUT_LOOKBACK = 20
+# 六均线密集
+MA_DENSE_THRESHOLD = 0.008       # 六条均线最大距离 / close，小于0.8%算密集
+DENSE_MIN_BARS = 10              # 连续密集至少10根K线
+RANGE_LOOKBACK = 20              # 用最近20根K线作为密集区高低点
 
+# 突破过滤
+BREAKOUT_ATR_MULT = 0.3          # 收盘突破区间 + ATR*0.3 才确认
+VOLUME_MULTIPLIER = 1.5          # 放量过滤
+MAX_PRE_MOVE = 0.035             # 最近10根涨跌幅超过3.5%不追，防追高追低
+
+# 回踩加仓
+RETEST_MAX_BARS = 12             # 突破后12根K线内等回踩
+RETEST_TOLERANCE_ATR = 0.25      # 回踩到突破位附近 ATR*0.25 内
+ADD_POSITION_PCT = 0.7           # 回踩确认加70%
+
+# 风控
 ATR_PERIOD = 14
 STOP_ATR_MULT = 1.0
-TP1_R = 2.0
-TP2_R = 4.0
-TRAIL_ATR_MULT = 1.2
+TRAIL_ATR_MULT = 1.5
+RISK_PCT = 0.01                  # 单笔完整计划最大亏损账户1%
+ENTRY_POSITION_PCT = 0.3         # 突破先开30%
 
-RISK_PCT = 0.01
+# 防双杀
+COOLDOWN_BARS = 10               # 止损后冷却10根K线
 
 
-def fetch_klines(symbol, interval, limit=1500):
+# =========================
+# 数据结构
+# =========================
+
+@dataclass
+class Position:
+    side: str
+    entry: float
+    qty: float
+    stop: float
+    full_risk_qty: float
+    range_high: float
+    range_low: float
+    breakout_level: float
+    added: bool
+    breakout_i: int
+    highest: float = 0.0
+    lowest: float = 0.0
+
+
+# =========================
+# 拉币安K线
+# =========================
+
+def fetch_klines(symbol: str, interval: str, limit: int = 1500) -> pd.DataFrame:
     url = "https://api.binance.com/api/v3/klines"
     params = {"symbol": symbol, "interval": interval, "limit": limit}
-    data = requests.get(url, params=params, timeout=10).json()
+    resp = requests.get(url, params=params, timeout=15)
+    resp.raise_for_status()
+    data = resp.json()
 
     df = pd.DataFrame(data, columns=[
         "open_time", "open", "high", "low", "close", "volume",
@@ -43,196 +97,262 @@ def fetch_klines(symbol, interval, limit=1500):
     return df
 
 
-def add_indicators(df):
+# =========================
+# 指标
+# =========================
+
+def add_indicators(df: pd.DataFrame) -> pd.DataFrame:
     for n in [20, 60, 120]:
         df[f"ma{n}"] = df["close"].rolling(n).mean()
         df[f"ema{n}"] = df["close"].ewm(span=n, adjust=False).mean()
+
+    ma_cols = ["ma20", "ma60", "ma120", "ema20", "ema60", "ema120"]
+    df["ma_max"] = df[ma_cols].max(axis=1)
+    df["ma_min"] = df[ma_cols].min(axis=1)
+    df["ma_spread"] = (df["ma_max"] - df["ma_min"]) / df["close"]
+    df["dense"] = df["ma_spread"] < MA_DENSE_THRESHOLD
+    df["dense_count"] = df["dense"].astype(int).groupby((~df["dense"]).cumsum()).cumsum()
 
     df["volume_ma20"] = df["volume"].rolling(20).mean()
 
     high_low = df["high"] - df["low"]
     high_close = (df["high"] - df["close"].shift()).abs()
     low_close = (df["low"] - df["close"].shift()).abs()
-
     df["tr"] = pd.concat([high_low, high_close, low_close], axis=1).max(axis=1)
     df["atr"] = df["tr"].rolling(ATR_PERIOD).mean()
 
     return df
 
 
-def check_signal(df, i):
+# =========================
+# 信号
+# =========================
+
+def check_breakout_signal(df: pd.DataFrame, i: int) -> Optional[Dict]:
     row = df.iloc[i]
 
-    ma_cols = ["ma20", "ma60", "ma120", "ema20", "ema60", "ema120"]
-
-    if row[ma_cols].isna().any() or pd.isna(row["atr"]):
+    if pd.isna(row["atr"]) or pd.isna(row["volume_ma20"]):
         return None
 
-    ma_max = row[ma_cols].max()
-    ma_min = row[ma_cols].min()
-    ma_spread = (ma_max - ma_min) / row["close"]
+    # 必须前面已经连续密集
+    if row["dense_count"] < DENSE_MIN_BARS:
+        return None
 
-    dense = ma_spread < MA_DENSE_THRESHOLD
-    if not dense:
+    # 防追高追低：最近10根已经单边走太多，不追
+    recent_10_open = df["open"].iloc[i - 9]
+    pre_move = abs(row["close"] - recent_10_open) / recent_10_open
+    if pre_move > MAX_PRE_MOVE:
         return None
 
     volume_ok = row["volume"] > row["volume_ma20"] * VOLUME_MULTIPLIER
     if not volume_ok:
         return None
 
-    recent_high = df["high"].iloc[i - BREAKOUT_LOOKBACK:i].max()
-    recent_low = df["low"].iloc[i - BREAKOUT_LOOKBACK:i].min()
+    range_high = df["high"].iloc[i - RANGE_LOOKBACK:i].max()
+    range_low = df["low"].iloc[i - RANGE_LOOKBACK:i].min()
 
-    if row["close"] > ma_max and row["close"] > recent_high:
-        return "LONG"
+    long_confirm = row["close"] > range_high + row["atr"] * BREAKOUT_ATR_MULT
+    short_confirm = row["close"] < range_low - row["atr"] * BREAKOUT_ATR_MULT
 
-    if row["close"] < ma_min and row["close"] < recent_low:
-        return "SHORT"
+    if long_confirm:
+        return {
+            "side": "LONG",
+            "range_high": range_high,
+            "range_low": range_low,
+            "breakout_level": range_high
+        }
+
+    if short_confirm:
+        return {
+            "side": "SHORT",
+            "range_high": range_high,
+            "range_low": range_low,
+            "breakout_level": range_low
+        }
 
     return None
 
 
-def calc_qty(balance, entry, stop):
+def calc_full_risk_qty(balance: float, entry: float, stop: float) -> float:
     max_loss = balance * RISK_PCT
     risk_per_unit = abs(entry - stop)
-
     if risk_per_unit <= 0:
-        return 0
-
+        return 0.0
     return max_loss / risk_per_unit
 
 
-def backtest(df):
-    balance = INITIAL_BALANCE
-    position = None
-    trades = []
-    peak_balance = balance
-    max_drawdown = 0
+# =========================
+# 回测
+# =========================
 
-    start_i = max(130, BREAKOUT_LOOKBACK + 1)
+def backtest(df: pd.DataFrame):
+    balance = INITIAL_BALANCE
+    peak_balance = balance
+    max_drawdown = 0.0
+
+    position: Optional[Position] = None
+    trades: List[Dict] = []
+    cooldown_until = -1
+
+    start_i = max(140, RANGE_LOOKBACK + DENSE_MIN_BARS + 5)
 
     for i in range(start_i, len(df)):
         row = df.iloc[i]
 
-        if position:
-            side = position["side"]
-            entry = position["entry"]
-            qty = position["qty"]
-            stop = position["stop"]
-            tp1 = position["tp1"]
-            tp2 = position["tp2"]
-
+        # 管理持仓
+        if position is not None:
+            side = position.side
             exit_price = None
             exit_reason = None
 
-            if side == "LONG":
-                position["highest"] = max(position["highest"], row["high"])
-                trail_stop = position["highest"] - row["atr"] * TRAIL_ATR_MULT
-                stop = max(stop, trail_stop)
-
-                if row["low"] <= stop:
-                    exit_price = stop
-                    exit_reason = "STOP/TRAIL"
-                elif row["high"] >= tp2:
-                    exit_price = tp2
-                    exit_reason = "TP2"
-                elif row["high"] >= tp1 and not position["tp1_hit"]:
-                    position["tp1_hit"] = True
-                    position["stop"] = entry
-                    continue
-
-            if side == "SHORT":
-                position["lowest"] = min(position["lowest"], row["low"])
-                trail_stop = position["lowest"] + row["atr"] * TRAIL_ATR_MULT
-                stop = min(stop, trail_stop)
-
-                if row["high"] >= stop:
-                    exit_price = stop
-                    exit_reason = "STOP/TRAIL"
-                elif row["low"] <= tp2:
-                    exit_price = tp2
-                    exit_reason = "TP2"
-                elif row["low"] <= tp1 and not position["tp1_hit"]:
-                    position["tp1_hit"] = True
-                    position["stop"] = entry
-                    continue
-
-            position["stop"] = stop
-
-            if exit_price:
+            # 先处理回踩加仓
+            if not position.added and i - position.breakout_i <= RETEST_MAX_BARS:
                 if side == "LONG":
-                    pnl = (exit_price - entry) * qty
-                else:
-                    pnl = (entry - exit_price) * qty
+                    retest_zone = position.breakout_level + row["atr"] * RETEST_TOLERANCE_ATR
+                    touched_retest = row["low"] <= retest_zone
+                    still_valid = row["close"] > position.breakout_level
+                    if touched_retest and still_valid:
+                        add_qty = position.full_risk_qty * ADD_POSITION_PCT
+                        add_price = row["close"]
+                        old_value = position.entry * position.qty
+                        new_value = add_price * add_qty
+                        position.qty += add_qty
+                        position.entry = (old_value + new_value) / position.qty
+                        position.added = True
 
-                fee = (entry * qty + exit_price * qty) * FEE_RATE
+                else:
+                    retest_zone = position.breakout_level - row["atr"] * RETEST_TOLERANCE_ATR
+                    touched_retest = row["high"] >= retest_zone
+                    still_valid = row["close"] < position.breakout_level
+                    if touched_retest and still_valid:
+                        add_qty = position.full_risk_qty * ADD_POSITION_PCT
+                        add_price = row["close"]
+                        old_value = position.entry * position.qty
+                        new_value = add_price * add_qty
+                        position.qty += add_qty
+                        position.entry = (old_value + new_value) / position.qty
+                        position.added = True
+
+            # 移动止损 + 出场
+            if side == "LONG":
+                position.highest = max(position.highest, row["high"])
+                trail_stop = position.highest - row["atr"] * TRAIL_ATR_MULT
+                position.stop = max(position.stop, trail_stop)
+
+                if row["low"] <= position.stop:
+                    exit_price = position.stop
+                    exit_reason = "STOP/TRAIL"
+
+            else:
+                position.lowest = min(position.lowest, row["low"])
+                trail_stop = position.lowest + row["atr"] * TRAIL_ATR_MULT
+                position.stop = min(position.stop, trail_stop)
+
+                if row["high"] >= position.stop:
+                    exit_price = position.stop
+                    exit_reason = "STOP/TRAIL"
+
+            if exit_price is not None:
+                if side == "LONG":
+                    pnl = (exit_price - position.entry) * position.qty
+                else:
+                    pnl = (position.entry - exit_price) * position.qty
+
+                fee = (position.entry * position.qty + exit_price * position.qty) * FEE_RATE
                 pnl -= fee
                 balance += pnl
 
                 trades.append({
                     "time": row["time"],
                     "side": side,
-                    "entry": entry,
+                    "entry": position.entry,
                     "exit": exit_price,
+                    "qty": position.qty,
                     "pnl": pnl,
                     "balance": balance,
-                    "reason": exit_reason
+                    "reason": exit_reason,
+                    "added": position.added
                 })
 
                 peak_balance = max(peak_balance, balance)
                 dd = (peak_balance - balance) / peak_balance
                 max_drawdown = max(max_drawdown, dd)
 
+                # 亏损单冷却
+                if pnl < 0:
+                    cooldown_until = i + COOLDOWN_BARS
+
                 position = None
 
-        else:
-            signal = check_signal(df, i)
-            if not signal:
+            continue
+
+        # 没持仓时找信号
+        if i <= cooldown_until:
+            continue
+
+        signal = check_breakout_signal(df, i)
+        if signal is None:
+            continue
+
+        entry = row["close"]
+        atr = row["atr"]
+        side = signal["side"]
+
+        if side == "LONG":
+            # 止损放在密集区下沿和ATR止损中更宽的位置
+            stop = min(entry - atr * STOP_ATR_MULT, signal["range_low"] - atr * 0.2)
+            full_qty = calc_full_risk_qty(balance, entry, stop)
+            entry_qty = full_qty * ENTRY_POSITION_PCT
+
+            if entry_qty <= 0:
                 continue
 
-            entry = row["close"]
-            atr = row["atr"]
+            position = Position(
+                side="LONG",
+                entry=entry,
+                qty=entry_qty,
+                stop=stop,
+                full_risk_qty=full_qty,
+                range_high=signal["range_high"],
+                range_low=signal["range_low"],
+                breakout_level=signal["breakout_level"],
+                added=False,
+                breakout_i=i,
+                highest=row["high"],
+                lowest=row["low"]
+            )
 
-            if signal == "LONG":
-                stop = entry - atr * STOP_ATR_MULT
-                risk = entry - stop
-                tp1 = entry + risk * TP1_R
-                tp2 = entry + risk * TP2_R
-                qty = calc_qty(balance, entry, stop)
+        else:
+            stop = max(entry + atr * STOP_ATR_MULT, signal["range_high"] + atr * 0.2)
+            full_qty = calc_full_risk_qty(balance, entry, stop)
+            entry_qty = full_qty * ENTRY_POSITION_PCT
 
-                position = {
-                    "side": "LONG",
-                    "entry": entry,
-                    "qty": qty,
-                    "stop": stop,
-                    "tp1": tp1,
-                    "tp2": tp2,
-                    "tp1_hit": False,
-                    "highest": row["high"]
-                }
+            if entry_qty <= 0:
+                continue
 
-            elif signal == "SHORT":
-                stop = entry + atr * STOP_ATR_MULT
-                risk = stop - entry
-                tp1 = entry - risk * TP1_R
-                tp2 = entry - risk * TP2_R
-                qty = calc_qty(balance, entry, stop)
-
-                position = {
-                    "side": "SHORT",
-                    "entry": entry,
-                    "qty": qty,
-                    "stop": stop,
-                    "tp1": tp1,
-                    "tp2": tp2,
-                    "tp1_hit": False,
-                    "lowest": row["low"]
-                }
+            position = Position(
+                side="SHORT",
+                entry=entry,
+                qty=entry_qty,
+                stop=stop,
+                full_risk_qty=full_qty,
+                range_high=signal["range_high"],
+                range_low=signal["range_low"],
+                breakout_level=signal["breakout_level"],
+                added=False,
+                breakout_i=i,
+                highest=row["high"],
+                lowest=row["low"]
+            )
 
     return balance, trades, max_drawdown
 
 
-def report(balance, trades, max_drawdown):
+# =========================
+# 报告
+# =========================
+
+def report(balance: float, trades: List[Dict], max_drawdown: float):
     wins = [t for t in trades if t["pnl"] > 0]
     losses = [t for t in trades if t["pnl"] <= 0]
 
@@ -241,8 +361,12 @@ def report(balance, trades, max_drawdown):
 
     win_rate = len(wins) / len(trades) * 100 if trades else 0
     pf = total_profit / total_loss if total_loss > 0 else 0
+    avg_win = total_profit / len(wins) if wins else 0
+    avg_loss = total_loss / len(losses) if losses else 0
+    payoff = avg_win / avg_loss if avg_loss > 0 else 0
+    added_count = sum(1 for t in trades if t["added"])
 
-    print("\n【V8 六均线密集突破回测报告】")
+    print("\n【V8.2 六均线密集突破 + 30%追击 + 70%回踩回测报告】")
     print(f"交易对：{SYMBOL}")
     print(f"周期：{INTERVAL}")
     print(f"初始资金：{INITIAL_BALANCE:.2f}")
@@ -250,20 +374,32 @@ def report(balance, trades, max_drawdown):
     print(f"收益率：{(balance / INITIAL_BALANCE - 1) * 100:.2f}%")
     print(f"最大回撤：{max_drawdown * 100:.2f}%")
     print(f"交易次数：{len(trades)}")
+    print(f"加仓次数：{added_count}")
     print(f"胜率：{win_rate:.2f}%")
+    print(f"平均盈利：{avg_win:.4f}")
+    print(f"平均亏损：{avg_loss:.4f}")
+    print(f"盈亏比：{payoff:.2f}")
     print(f"Profit Factor：{pf:.2f}")
 
-    print("\n最近10笔交易：")
-    for t in trades[-10:]:
+    print("\n最近20笔交易：")
+    for t in trades[-20:]:
         print(
             f"{t['time']} | {t['side']} | "
             f"entry={t['entry']:.2f} exit={t['exit']:.2f} "
-            f"pnl={t['pnl']:.4f} | {t['reason']}"
+            f"qty={t['qty']:.6f} pnl={t['pnl']:.4f} "
+            f"balance={t['balance']:.2f} added={t['added']} | {t['reason']}"
         )
 
 
 if __name__ == "__main__":
+    print("正在获取币安真实K线...")
     df = fetch_klines(SYMBOL, INTERVAL, LIMIT)
     df = add_indicators(df)
+
     balance, trades, max_drawdown = backtest(df)
     report(balance, trades, max_drawdown)
+'''
+
+path = Path("/mnt/data/v8_2_six_ma_breakout_backtest.py")
+path.write_text(code, encoding="utf-8")
+print(f"已生成文件：{path}")
